@@ -176,7 +176,7 @@ fn system_notification_clicks_keep_endpoint_and_boot_identity() {
 fn machine_diagnostic_badge_reopens_notice_without_collapsing_machine() {
     let (mut state, id) = state_with_remote();
     state.set_endpoint_status(&id, ClientEndpointStatus::Attention);
-    state.set_machine_diagnostic(&id, "Permission denied (keyboard-interactive)".into());
+    state.set_machine_diagnostic(&id, "Host key verification failed".into());
     for _ in 0..2 {
         state.compose(120, 40).unwrap();
         let hit = state
@@ -195,10 +195,10 @@ fn machine_diagnostic_badge_reopens_notice_without_collapsing_machine() {
         assert!(outcome.repaint);
         assert!(!state.collapsed_endpoints.contains(&id));
         let notice = state.visible_endpoint_notice.take().unwrap();
-        assert!(notice.body.contains("Permission denied"));
+        assert!(notice.body.contains("Host key verification failed"));
         assert!(notice
             .title
-            .contains("herdr machine reconnect 0123456789abcdef0123456789abcdef"));
+            .contains("herdr machine status 0123456789abcdef0123456789abcdef"));
     }
     state.set_endpoint_status(&id, ClientEndpointStatus::Online);
     state.compose(120, 40).unwrap();
@@ -2737,4 +2737,103 @@ fn navigator_foreign_workspace_heading_keeps_the_workspace_target() {
             target: Some(ClientEndpointFocusTarget::Workspace(workspace_id)),
         }] if activated == &endpoint_id && workspace_id == "ws_1"
     ));
+}
+
+#[test]
+fn offline_and_auth_badges_request_reconnect_without_collapsing_or_switching() {
+    for status in [
+        ClientEndpointStatus::Offline,
+        ClientEndpointStatus::Attention,
+    ] {
+        let (mut state, id) = state_with_remote();
+        state.set_endpoint_status(&id, status);
+        if status == ClientEndpointStatus::Attention {
+            state.set_machine_diagnostic(&id, "Permission denied (publickey)".into());
+        }
+        for collapsed in [false, true] {
+            state.sidebar_collapsed = collapsed;
+            state.compose(120, 40).unwrap();
+            let hit = state
+                .hits
+                .machines
+                .iter()
+                .find(|hit| hit.endpoint_id == id)
+                .unwrap();
+            let outcome = state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: hit.status_badge.x,
+                row: hit.status_badge.y,
+                modifiers: KeyModifiers::NONE,
+            })]);
+            assert!(
+                matches!(outcome.actions.as_slice(), [ClientShellAction::ReconnectEndpoint(endpoint)] if endpoint == &id)
+            );
+            assert!(!state.collapsed_endpoints.contains(&id));
+            assert_eq!(state.active_endpoint_id, ClientEndpointId::Local);
+        }
+    }
+}
+
+#[test]
+fn waiting_for_key_badge_pulses_and_cancels_without_sending_input() {
+    let (mut state, id) = state_with_remote();
+    state.set_endpoint_status(&id, ClientEndpointStatus::WaitingForKey);
+    let now = std::time::Instant::now();
+    assert!(state.tick_machine_connection(now));
+    let bright = state
+        .machine_diagnostics
+        .key_style(&state.config.palette, Style::default());
+    assert!(!state.tick_machine_connection(now + std::time::Duration::from_millis(100)));
+    assert!(state.tick_machine_connection(now + std::time::Duration::from_millis(700)));
+    assert_ne!(
+        bright,
+        state
+            .machine_diagnostics
+            .key_style(&state.config.palette, Style::default())
+    );
+    let frame = state.compose(120, 40).unwrap();
+    let buffer = frame.to_ratatui_buffer().unwrap();
+    let hit = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id == id)
+        .unwrap();
+    let row = (hit.rect.x..hit.rect.right())
+        .map(|x| buffer[(x, hit.rect.y)].symbol())
+        .collect::<String>();
+    assert!(row.contains("Build"));
+    assert!(row.contains("touch key"));
+    let badge = hit.status_badge;
+    state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: badge.x,
+        row: badge.y,
+        modifiers: KeyModifiers::NONE,
+    })]);
+    let frame = state.compose(120, 40).unwrap();
+    let buffer = frame.to_ratatui_buffer().unwrap();
+    let hit = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| hit.endpoint_id == id)
+        .unwrap();
+    assert_eq!(hit.status_badge, badge);
+    let row = (hit.rect.x..hit.rect.right())
+        .map(|x| buffer[(x, hit.rect.y)].symbol())
+        .collect::<String>();
+    assert!(row.contains("cancel"));
+    let outcome = state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: hit.status_badge.x,
+        row: hit.status_badge.y,
+        modifiers: KeyModifiers::NONE,
+    })]);
+    assert!(
+        matches!(outcome.actions.as_slice(), [ClientShellAction::CancelEndpointConnection(endpoint)] if endpoint == &id)
+    );
+    assert!(outcome.requests.is_empty());
+    state.set_endpoint_status(&id, ClientEndpointStatus::Online);
+    assert!(!state.tick_machine_connection(now + std::time::Duration::from_secs(2)));
 }

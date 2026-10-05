@@ -16,9 +16,13 @@ pub(crate) fn connect_saved_ssh(
     profile_id: &str,
     target: &str,
     session: &str,
+    monitor: super::SshConnectionMonitor,
 ) -> io::Result<SavedSshStream> {
-    let ssh = validated_saved_ssh(profile_id, target, session)?;
+    monitor.check_cancelled()?;
+    let mut ssh = validated_saved_ssh(profile_id, target, session)?;
+    ssh.monitor = Some(monitor.clone());
     let remote_herdr = find_installed_remote_herdr(&ssh)?;
+    monitor.check_cancelled()?;
     let metadata = remote_herdr.machine_metadata();
     let path = saved_bridge_path(profile_id);
     let bridge = SshStdioBridge::start(

@@ -6,9 +6,41 @@ use crossterm::event::{MouseButton, MouseEventKind};
 pub(super) struct MachineDiagnostics {
     errors: HashMap<ClientEndpointId, String>,
     hover: Option<ClientEndpointId>,
+    pulse_bright: bool,
+    pulse_deadline: Option<std::time::Instant>,
 }
 
 impl MachineDiagnostics {
+    pub(super) fn actionable(&self, endpoint: &ClientShellEndpoint) -> bool {
+        matches!(
+            endpoint.status,
+            ClientEndpointStatus::Offline | ClientEndpointStatus::WaitingForKey
+        ) || self.errors.contains_key(&endpoint.endpoint_id)
+    }
+
+    pub(super) fn key_style(&self, palette: &Palette, style: Style) -> Style {
+        let style = style
+            .fg(if self.pulse_bright {
+                palette.yellow
+            } else {
+                palette.overlay1
+            })
+            .add_modifier(Modifier::BOLD);
+        if self.pulse_bright {
+            style
+        } else {
+            style.add_modifier(Modifier::DIM)
+        }
+    }
+
+    pub(super) fn key_label(&self, endpoint: &ClientShellEndpoint) -> &'static str {
+        if self.hover.as_ref() == Some(&endpoint.endpoint_id) {
+            "🔑 cancel   "
+        } else {
+            "🔑 touch key"
+        }
+    }
+
     pub(super) fn required_for(&self, endpoint: &ClientShellEndpoint) -> bool {
         self.errors
             .get(&endpoint.endpoint_id)
@@ -21,9 +53,7 @@ impl MachineDiagnostics {
         palette: &Palette,
         style: Style,
     ) -> Style {
-        if self.hover.as_ref() == Some(&endpoint.endpoint_id)
-            && self.errors.contains_key(&endpoint.endpoint_id)
-        {
+        if self.hover.as_ref() == Some(&endpoint.endpoint_id) && self.actionable(endpoint) {
             style
                 .bg(palette.active_row_bg)
                 .add_modifier(Modifier::REVERSED)
@@ -34,6 +64,42 @@ impl MachineDiagnostics {
 }
 
 impl ClientShellState {
+    pub(crate) fn clear_connection_notice(&mut self, id: &ClientEndpointId) {
+        self.clear_machine_diagnostic(id);
+        let ClientEndpointId::Ssh(profile_id) = id else {
+            return;
+        };
+        if self
+            .visible_endpoint_notice
+            .as_ref()
+            .is_some_and(|notice| notice.key.code == format!("machine-diagnostic:{profile_id}"))
+        {
+            self.visible_endpoint_notice = None;
+        }
+    }
+
+    pub(crate) fn tick_machine_connection(&mut self, now: std::time::Instant) -> bool {
+        if !self
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.status == ClientEndpointStatus::WaitingForKey)
+        {
+            self.machine_diagnostics.pulse_deadline = None;
+            return false;
+        }
+        if self
+            .machine_diagnostics
+            .pulse_deadline
+            .is_none_or(|deadline| now >= deadline)
+        {
+            self.machine_diagnostics.pulse_bright = !self.machine_diagnostics.pulse_bright;
+            self.machine_diagnostics.pulse_deadline =
+                Some(now + std::time::Duration::from_millis(700));
+            true
+        } else {
+            false
+        }
+    }
     pub(crate) fn set_machine_diagnostic(&mut self, id: &ClientEndpointId, message: String) {
         if !id.is_local() {
             self.machine_diagnostics.errors.insert(
@@ -73,9 +139,10 @@ impl ClientShellState {
             .find(|hit| {
                 contains(hit.status_badge, (mouse.column, mouse.row))
                     && self
-                        .machine_diagnostics
-                        .errors
-                        .contains_key(&hit.endpoint_id)
+                        .endpoints
+                        .iter()
+                        .find(|endpoint| endpoint.endpoint_id == hit.endpoint_id)
+                        .is_some_and(|endpoint| self.machine_diagnostics.actionable(endpoint))
             })
             .map(|hit| hit.endpoint_id.clone());
         if mouse.kind == MouseEventKind::Moved {
@@ -94,17 +161,34 @@ impl ClientShellState {
         if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
             return false;
         }
+        let status = self.endpoint_status(&id);
+        if status == Some(ClientEndpointStatus::WaitingForKey) {
+            outcome
+                .actions
+                .push(ClientShellAction::CancelEndpointConnection(id));
+            outcome.repaint = true;
+            return true;
+        }
+        if status == Some(ClientEndpointStatus::Offline)
+            || self
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.endpoint_id == id)
+                .is_some_and(|endpoint| self.machine_diagnostics.required_for(endpoint))
+        {
+            outcome
+                .actions
+                .push(ClientShellAction::ReconnectEndpoint(id));
+            outcome.repaint = true;
+            return true;
+        }
         let Some(error) = self.machine_diagnostics.errors.get(&id) else {
             return true;
         };
         let ClientEndpointId::Ssh(profile_id) = &id else {
             return true;
         };
-        let command = if crate::remote::ssh_error_requires_authentication(error) {
-            format!("herdr machine reconnect {profile_id}")
-        } else {
-            format!("herdr machine status {profile_id}")
-        };
+        let command = format!("herdr machine status {profile_id}");
         let code = format!("machine-diagnostic:{}", profile_id);
         // An explicit click can reopen its diagnostic, but must not replace another notice.
         if self

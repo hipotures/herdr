@@ -703,6 +703,9 @@ impl Drop for ManagedSshConfigDirectory {
 /// unknown/changed host keys. This does not imply permission to prompt.
 pub(crate) fn ssh_error_requires_authentication(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
+    if message.contains("ssh key confirmation timed out") {
+        return true;
+    }
     if message.contains("host key verification failed")
         || message.contains("remote host identification has changed")
     {
@@ -776,6 +779,7 @@ pub(super) struct RemoteSsh {
     session_name: String,
     managed_config: Option<ManagedSshConfig>,
     noninteractive: bool,
+    pub(super) monitor: Option<super::SshConnectionMonitor>,
 }
 
 impl RemoteSsh {
@@ -795,6 +799,7 @@ impl RemoteSsh {
             session_name,
             managed_config,
             noninteractive: false,
+            monitor: None,
         }
     }
 
@@ -825,6 +830,9 @@ impl RemoteSsh {
         let mut command = self.base_command();
         if self.noninteractive {
             apply_noninteractive_ssh_options(&mut command);
+            if self.monitor.is_some() {
+                command.arg("-vvv");
+            }
         }
         command.arg("-T").arg(&self.target);
         command
@@ -867,7 +875,11 @@ impl RemoteSsh {
                 "ssh bootstrap stdin missing",
             ))
         };
-        let output = wait_with_output_timeout(child, NONINTERACTIVE_SSH_COMMAND_TIMEOUT)?;
+        let output = wait_with_output_timeout(
+            child,
+            NONINTERACTIVE_SSH_COMMAND_TIMEOUT,
+            self.monitor.as_ref(),
+        )?;
         write_result?;
         normalize_remote_output(output)
     }
@@ -882,7 +894,11 @@ impl RemoteSsh {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let output = if self.noninteractive {
-            wait_with_output_timeout(command.spawn()?, NONINTERACTIVE_SSH_COMMAND_TIMEOUT)
+            wait_with_output_timeout(
+                command.spawn()?,
+                NONINTERACTIVE_SSH_COMMAND_TIMEOUT,
+                self.monitor.as_ref(),
+            )
         } else {
             output_with_forwarded_stderr(command.spawn()?, None)
         }?;
@@ -3990,6 +4006,7 @@ mod tests {
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: Some(managed_config),
             noninteractive: false,
+            monitor: None,
         };
 
         let command = ssh.command();
@@ -4061,6 +4078,7 @@ mod tests {
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: Some(managed_config),
             noninteractive: false,
+            monitor: None,
         };
         let args = ssh
             .command()
@@ -4140,6 +4158,7 @@ mod tests {
             session_name: "probe-options".into(),
             managed_config: Some(managed_config),
             noninteractive: false,
+            monitor: None,
         };
         let remote = RemoteHerdr::for_platform(RemotePlatform {
             os: "linux",
@@ -4271,6 +4290,7 @@ mod tests {
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: None,
             noninteractive: false,
+            monitor: None,
         };
 
         let command = ssh.command();

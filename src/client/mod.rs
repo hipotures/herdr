@@ -1273,7 +1273,69 @@ async fn run_client_loop(
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
+            ClientLoopEvent::ReconnectEndpoint(endpoint_id) => {
+                if supervisors.reconnect(&endpoint_id, now) {
+                    if let Some(shell) = state.shell.as_mut() {
+                        shell.clear_connection_notice(&endpoint_id);
+                        shell.set_endpoint_status(
+                            &endpoint_id,
+                            endpoint::ClientEndpointStatus::Connecting,
+                        );
+                    }
+                    state.request_repaint();
+                    if let Some(frame) = state.shell.as_mut().and_then(|shell| {
+                        shell.compose(state.reported_size.0, state.reported_size.1)
+                    }) {
+                        state.present_frame(frame);
+                    }
+                }
+            }
+            ClientLoopEvent::CancelEndpointConnection(endpoint_id) => {
+                if supervisors.cancel(&endpoint_id) {
+                    if let Some(shell) = state.shell.as_mut() {
+                        shell.clear_connection_notice(&endpoint_id);
+                        shell.set_endpoint_status(
+                            &endpoint_id,
+                            endpoint::ClientEndpointStatus::Offline,
+                        );
+                    }
+                    state.request_repaint();
+                    if let Some(frame) = state.shell.as_mut().and_then(|shell| {
+                        shell.compose(state.reported_size.0, state.reported_size.1)
+                    }) {
+                        state.present_frame(frame);
+                    }
+                }
+            }
             ClientLoopEvent::EndpointSupervisor(event) => match event {
+                endpoint::EndpointSupervisorEvent::Progress {
+                    endpoint_id,
+                    generation,
+                    progress,
+                } => {
+                    if !supervisors.accepts_progress(&endpoint_id, generation) {
+                        continue;
+                    }
+                    if let Some(shell) = state.shell.as_mut() {
+                        shell.set_endpoint_status(
+                            &endpoint_id,
+                            match progress {
+                                crate::remote::SshConnectionProgress::WaitingForKey => {
+                                    endpoint::ClientEndpointStatus::WaitingForKey
+                                }
+                                crate::remote::SshConnectionProgress::Connecting => {
+                                    endpoint::ClientEndpointStatus::Connecting
+                                }
+                            },
+                        );
+                    }
+                    state.request_repaint();
+                    if let Some(frame) = state.shell.as_mut().and_then(|shell| {
+                        shell.compose(state.reported_size.0, state.reported_size.1)
+                    }) {
+                        state.present_frame(frame);
+                    }
+                }
                 endpoint::EndpointSupervisorEvent::Status {
                     endpoint_id,
                     generation,
@@ -1282,6 +1344,11 @@ async fn run_client_loop(
                 } => {
                     if !supervisors.record_status(&endpoint_id, generation, status, now) {
                         continue;
+                    }
+                    if status == endpoint::ClientEndpointStatus::Attention
+                        && crate::remote::ssh_error_requires_authentication(&message)
+                    {
+                        supervisors.cancel(&endpoint_id);
                     }
                     if status == endpoint::ClientEndpointStatus::Attention {
                         warn!(endpoint = %endpoint_id.storage_key(), generation, error = %message, "endpoint needs attention");
@@ -2280,6 +2347,7 @@ async fn run_client_loop(
                         outcome.repaint |= notification_repaint
                             | shell.tick_copy_feedback(now)
                             | shell.tick_workspace_highlight(now)
+                            | shell.tick_machine_connection(now)
                             | shell.tick_endpoint_error(now);
                         let frame = outcome
                             .repaint

@@ -12,6 +12,13 @@ pub(super) fn dispatch_client_shell_actions(
     let mut repaint = false;
     for action in actions {
         match action {
+            shell::ClientShellAction::ReconnectEndpoint(endpoint_id) => {
+                *scheduled_activation = Some(ClientLoopEvent::ReconnectEndpoint(endpoint_id));
+            }
+            shell::ClientShellAction::CancelEndpointConnection(endpoint_id) => {
+                *scheduled_activation =
+                    Some(ClientLoopEvent::CancelEndpointConnection(endpoint_id));
+            }
             shell::ClientShellAction::Endpoint {
                 endpoint_id,
                 boot_id,

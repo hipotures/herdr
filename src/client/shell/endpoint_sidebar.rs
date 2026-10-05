@@ -93,6 +93,20 @@ pub(super) fn render_collapsed(
             let mut status_badge = Rect::default();
             if !endpoint.endpoint_id.is_local() {
                 let (glyph, _, color) = endpoint_status_presentation(endpoint.status, palette);
+                let glyph = if state.machine_diagnostics.required_for(endpoint)
+                    && endpoint.status != ClientEndpointStatus::WaitingForKey
+                {
+                    "↻"
+                } else {
+                    glyph
+                };
+                let style = if endpoint.status == ClientEndpointStatus::WaitingForKey {
+                    state
+                        .machine_diagnostics
+                        .key_style(palette, Style::default())
+                } else {
+                    Style::default().fg(color)
+                };
                 let width = display_width(glyph).min(rect.width);
                 status_badge = Rect::new(rect.right().saturating_sub(width), rect.y, width, 1);
                 put_right_text(
@@ -100,11 +114,9 @@ pub(super) fn render_collapsed(
                     rect,
                     rect.y,
                     glyph,
-                    state.machine_diagnostics.badge_style(
-                        endpoint,
-                        palette,
-                        Style::default().fg(color),
-                    ),
+                    state
+                        .machine_diagnostics
+                        .badge_style(endpoint, palette, style),
                 );
             }
             hits.machines.push(MachineHit {
@@ -605,8 +617,10 @@ fn render_endpoint_row(
     } else {
         state
     };
-    let signal = if auth.required_for(endpoint) {
-        "! auth".to_owned()
+    let signal = if endpoint.status == ClientEndpointStatus::WaitingForKey {
+        auth.key_label(endpoint).to_owned()
+    } else if auth.required_for(endpoint) {
+        "↻ auth".to_owned()
     } else if endpoint.status == ClientEndpointStatus::Attention {
         "! error".to_owned()
     } else if endpoint.endpoint_id.is_local() {
@@ -625,7 +639,10 @@ fn render_endpoint_row(
         &format!(" {marker} {}", endpoint.label),
         Style::default()
             .fg(
-                if matches!(endpoint.status, ClientEndpointStatus::Disabled) {
+                if matches!(
+                    endpoint.status,
+                    ClientEndpointStatus::Disabled | ClientEndpointStatus::Offline
+                ) {
                     palette.overlay0
                 } else {
                     palette.text
@@ -638,7 +655,15 @@ fn render_endpoint_row(
         rect,
         rect.y,
         &signal,
-        auth.badge_style(endpoint, palette, Style::default().fg(color)),
+        auth.badge_style(
+            endpoint,
+            palette,
+            if endpoint.status == ClientEndpointStatus::WaitingForKey {
+                auth.key_style(palette, Style::default())
+            } else {
+                Style::default().fg(color)
+            },
+        ),
     );
     Rect::new(
         rect.right().saturating_sub(signal_width),

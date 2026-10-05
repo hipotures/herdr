@@ -207,6 +207,8 @@ fn mobile_endpoint_state(status: ClientEndpointStatus) -> &'static str {
         ClientEndpointStatus::Connecting => "connecting",
         ClientEndpointStatus::Online => "online",
         ClientEndpointStatus::Reconnecting => "reconnecting",
+        ClientEndpointStatus::Offline => "offline",
+        ClientEndpointStatus::WaitingForKey => "touch security key",
         ClientEndpointStatus::Attention => "attention",
         ClientEndpointStatus::Disabled => "disabled",
     }

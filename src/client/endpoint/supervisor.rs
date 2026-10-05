@@ -12,6 +12,7 @@ const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(120);
 const MAX_LOCAL_RETRY_DELAY: Duration = Duration::from_secs(30);
 const STABLE_CONNECTION_PERIOD: Duration = Duration::from_secs(60);
+const AUTO_RECONNECT_PERIOD: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
 pub(crate) struct EndpointConnectOptions {
@@ -26,6 +27,11 @@ pub(crate) struct EndpointConnectOptions {
 }
 
 pub(crate) enum EndpointSupervisorEvent {
+    Progress {
+        endpoint_id: ClientEndpointId,
+        generation: u64,
+        progress: crate::remote::SshConnectionProgress,
+    },
     Status {
         endpoint_id: ClientEndpointId,
         generation: u64,
@@ -54,6 +60,8 @@ struct ReconnectState {
     in_flight: bool,
     generation: Option<u64>,
     online_since: Option<Instant>,
+    retry_since: Option<Instant>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl ReconnectState {
@@ -65,6 +73,8 @@ impl ReconnectState {
             in_flight: false,
             generation: None,
             online_since: None,
+            retry_since: Some(now),
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -120,6 +130,7 @@ impl EndpointSupervisors {
                     && profile.session == previous.session
             });
             if !keep {
+                state.cancelled.store(true, Ordering::Release);
                 retired.push(endpoint_id.clone());
             }
             keep
@@ -141,11 +152,37 @@ impl EndpointSupervisors {
         event_tx: &tokio::sync::mpsc::Sender<EndpointSupervisorEvent>,
     ) {
         for (endpoint_id, state) in &mut self.endpoints {
+            if !endpoint_id.is_local()
+                && !state.in_flight
+                && state.generation.is_some()
+                && state.next_attempt.is_some()
+                && state.retry_since.is_some_and(|since| {
+                    now.saturating_duration_since(since) >= AUTO_RECONNECT_PERIOD
+                })
+            {
+                if let Some(generation) = state.generation {
+                    if event_tx
+                        .try_send(EndpointSupervisorEvent::Status {
+                            endpoint_id: endpoint_id.clone(),
+                            generation,
+                            status: ClientEndpointStatus::Offline,
+                            message: "Machine is unavailable; click ↻ to reconnect".into(),
+                        })
+                        .is_ok()
+                    {
+                        state.next_attempt = None;
+                    }
+                }
+                continue;
+            }
             if state.in_flight || state.next_attempt.is_none_or(|deadline| deadline > now) {
                 continue;
             }
             state.in_flight = true;
             state.next_attempt = None;
+            if state.generation.is_none() {
+                state.retry_since = Some(now);
+            }
             let generation = self.next_generation;
             state.generation = Some(generation);
             self.next_generation = self.next_generation.saturating_add(1);
@@ -153,13 +190,24 @@ impl EndpointSupervisors {
             let target = state.target.clone();
             let event_tx = event_tx.clone();
             let shutdown = self.shutdown.clone();
+            let cancelled = state.cancelled.clone();
             tokio::spawn(async move {
                 if shutdown.load(Ordering::Acquire) {
                     return;
                 }
                 let task_endpoint_id = endpoint_id.clone();
+                let progress_id = endpoint_id.clone();
+                let progress_tx = event_tx.clone();
+                let monitor =
+                    crate::remote::SshConnectionMonitor::new(cancelled, move |progress| {
+                        let _ = progress_tx.blocking_send(EndpointSupervisorEvent::Progress {
+                            endpoint_id: progress_id.clone(),
+                            generation,
+                            progress,
+                        });
+                    });
                 let result = tokio::task::spawn_blocking(move || {
-                    connect_once(&target, options, endpoint_id, generation)
+                    connect_once(&target, options, endpoint_id, generation, monitor)
                 })
                 .await;
                 let event = match result {
@@ -209,6 +257,7 @@ impl EndpointSupervisors {
                 }
                 state.online_since.get_or_insert(now);
                 state.next_attempt = None;
+                state.retry_since = None;
             }
             ClientEndpointStatus::Attention => {
                 state.online_since = None;
@@ -216,11 +265,12 @@ impl EndpointSupervisors {
                 state.next_attempt =
                     (!endpoint_id.is_local()).then_some(now + Duration::from_secs(30));
             }
-            ClientEndpointStatus::Disabled => {
+            ClientEndpointStatus::Disabled | ClientEndpointStatus::Offline => {
                 state.online_since = None;
                 state.next_attempt = None;
             }
             ClientEndpointStatus::Connecting | ClientEndpointStatus::Reconnecting => {
+                state.retry_since.get_or_insert(now);
                 // A brief maintenance wake can complete a handshake without restoring the link.
                 if state.online_since.take().is_some_and(|connected| {
                     now.saturating_duration_since(connected) >= STABLE_CONNECTION_PERIOD
@@ -237,6 +287,7 @@ impl EndpointSupervisors {
                     },
                 );
             }
+            ClientEndpointStatus::WaitingForKey => {}
         }
         true
     }
@@ -254,11 +305,54 @@ impl EndpointSupervisors {
             now,
         )
     }
+
+    pub(crate) fn accepts_progress(&self, endpoint_id: &ClientEndpointId, generation: u64) -> bool {
+        self.endpoints
+            .get(endpoint_id)
+            .is_some_and(|state| state.in_flight && state.generation == Some(generation))
+    }
+
+    pub(crate) fn reconnect(&mut self, endpoint_id: &ClientEndpointId, now: Instant) -> bool {
+        let Some(state) = self
+            .endpoints
+            .get_mut(endpoint_id)
+            .filter(|state| !state.in_flight)
+        else {
+            return false;
+        };
+        if endpoint_id.is_local() {
+            return false;
+        }
+        state.attempts = 0;
+        state.retry_since = Some(now);
+        state.next_attempt = Some(now);
+        state.generation = None;
+        state.cancelled = Arc::new(AtomicBool::new(false));
+        true
+    }
+
+    pub(crate) fn cancel(&mut self, endpoint_id: &ClientEndpointId) -> bool {
+        let Some(state) = self.endpoints.get_mut(endpoint_id) else {
+            return false;
+        };
+        if endpoint_id.is_local() {
+            return false;
+        }
+        state.cancelled.store(true, Ordering::Release);
+        state.generation = None;
+        state.in_flight = false;
+        state.next_attempt = None;
+        state.online_since = None;
+        true
+    }
 }
 
 impl Drop for EndpointSupervisors {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        for state in self.endpoints.values() {
+            state.cancelled.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -267,6 +361,7 @@ fn connect_once(
     options: EndpointConnectOptions,
     endpoint_id: ClientEndpointId,
     generation: u64,
+    monitor: crate::remote::SshConnectionMonitor,
 ) -> Result<EndpointSupervisorEvent, std::io::Error> {
     let (mut stream, lifetime): (_, Box<dyn Send>) = match target {
         ConnectTarget::Local(path) => {
@@ -288,6 +383,7 @@ fn connect_once(
                 profile.id.as_str(),
                 &profile.target,
                 &profile.session,
+                monitor,
             )?;
             (connected.stream, Box::new(connected.bridge))
         }
@@ -381,6 +477,96 @@ mod tests {
             session: "agents".into(),
             enabled: true,
         }
+    }
+
+    fn options() -> EndpointConnectOptions {
+        EndpointConnectOptions {
+            cols: 120,
+            rows: 40,
+            cell_width_px: 8,
+            cell_height_px: 16,
+            pixel_geometry_exact: false,
+            surface_size: ClientSurfaceSize { cols: 90, rows: 36 },
+            endpoint_keybindings: false,
+            mouse_capture: false,
+        }
+    }
+
+    #[test]
+    fn remote_retry_budget_goes_offline_and_requires_an_explicit_retry() {
+        let now = Instant::now();
+        let profile = profile();
+        let id = ClientEndpointId::Ssh(profile.id.clone());
+        let mut supervisors = EndpointSupervisors::new(&[profile], now);
+        let state = supervisors.endpoints.get_mut(&id).unwrap();
+        state.generation = Some(2);
+        state.next_attempt = Some(now + MAX_RETRY_DELAY);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        supervisors.spawn_due(now + Duration::from_secs(59), options(), &tx);
+        assert!(rx.try_recv().is_err());
+        supervisors.spawn_due(now + AUTO_RECONNECT_PERIOD, options(), &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            EndpointSupervisorEvent::Status {
+                status: ClientEndpointStatus::Offline,
+                generation: 2,
+                ..
+            }
+        ));
+        assert!(supervisors.record_status(
+            &id,
+            2,
+            ClientEndpointStatus::Offline,
+            now + AUTO_RECONNECT_PERIOD
+        ));
+        supervisors.spawn_due(now + Duration::from_secs(3600), options(), &tx);
+        assert!(rx.try_recv().is_err());
+        assert!(supervisors.reconnect(&id, now + Duration::from_secs(3601)));
+        assert_eq!(
+            supervisors.endpoints[&id].next_attempt,
+            Some(now + Duration::from_secs(3601))
+        );
+        assert_eq!(supervisors.endpoints[&id].attempts, 0);
+        assert!(!supervisors.record_status(&id, 2, ClientEndpointStatus::Online, now));
+    }
+
+    #[test]
+    fn key_confirmation_stays_in_flight_and_cancellation_fences_late_results() {
+        let now = Instant::now();
+        let profile = profile();
+        let id = ClientEndpointId::Ssh(profile.id.clone());
+        let mut supervisors = EndpointSupervisors::new(&[profile], now);
+        let state = supervisors.endpoints.get_mut(&id).unwrap();
+        state.generation = Some(2);
+        state.in_flight = true;
+        state.next_attempt = None;
+        let cancelled = state.cancelled.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        supervisors.spawn_due(now + AUTO_RECONNECT_PERIOD, options(), &tx);
+        assert!(rx.try_recv().is_err());
+        assert!(supervisors.accepts_progress(&id, 2));
+        assert!(!supervisors.reconnect(&id, now));
+        assert!(supervisors.cancel(&id));
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(!supervisors.accepts_progress(&id, 2));
+        assert!(!supervisors.record_status(&id, 2, ClientEndpointStatus::Online, now));
+        assert!(supervisors.endpoints[&id].next_attempt.is_none());
+        assert!(supervisors.reconnect(&id, now));
+        assert!(!supervisors.endpoints[&id].cancelled.load(Ordering::Acquire));
+        assert!(cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn online_connection_starts_a_fresh_budget_on_disconnect() {
+        let now = Instant::now();
+        let id = ClientEndpointId::Ssh(profile().id);
+        let mut supervisors = EndpointSupervisors::new(&[profile()], now);
+        supervisors.endpoints.get_mut(&id).unwrap().generation = Some(2);
+        assert!(supervisors.record_status(&id, 2, ClientEndpointStatus::Online, now));
+        assert_eq!(supervisors.endpoints[&id].retry_since, None);
+        let later = now + Duration::from_secs(3600);
+        assert!(supervisors.disconnected(&id, 2, later));
+        assert_eq!(supervisors.endpoints[&id].retry_since, Some(later));
     }
 
     #[test]

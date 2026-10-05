@@ -241,6 +241,8 @@ pub(super) struct WorkspaceHit {
 
 #[derive(Debug)]
 pub(crate) enum ClientShellAction {
+    ReconnectEndpoint(ClientEndpointId),
+    CancelEndpointConnection(ClientEndpointId),
     Endpoint {
         endpoint_id: ClientEndpointId,
         boot_id: String,

@@ -2,6 +2,8 @@ use super::*;
 
 /// Internal events for the client event loop.
 pub(super) enum ClientLoopEvent {
+    ReconnectEndpoint(super::endpoint::ClientEndpointId),
+    CancelEndpointConnection(super::endpoint::ClientEndpointId),
     #[cfg(unix)]
     StdinInput(Vec<u8>),
     #[cfg(unix)]

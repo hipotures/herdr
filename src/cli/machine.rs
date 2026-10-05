@@ -201,7 +201,7 @@ fn reconnect(args: &[String]) -> std::io::Result<i32> {
     }
     crate::remote::check_saved_ssh(&profile.target, &profile.session)?;
     println!(
-        "Machine {} is reachable. Open Herdr clients retry within 30 seconds.",
+        "Machine {} is reachable. Click ↻ in open Herdr clients to reconnect.",
         profile.id
     );
     Ok(0)
