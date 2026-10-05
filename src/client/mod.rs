@@ -1317,6 +1317,7 @@ async fn run_client_loop(
                         continue;
                     }
                     if let Some(shell) = state.shell.as_mut() {
+                        shell.clear_connection_notice(&endpoint_id);
                         shell.set_endpoint_status(
                             &endpoint_id,
                             match progress {

@@ -831,7 +831,9 @@ impl RemoteSsh {
         if self.noninteractive {
             apply_noninteractive_ssh_options(&mut command);
             if self.monitor.is_some() {
-                command.arg("-vvv");
+                // -v keeps a ControlPersist master's stderr open after the
+                // foreground command exits, which would block its reader join.
+                command.arg("-o").arg("LogLevel=DEBUG3");
             }
         }
         command.arg("-T").arg(&self.target);
@@ -4201,6 +4203,26 @@ mod tests {
             assert!(args.iter().any(|arg| arg == required), "missing {required}");
         }
         assert_eq!(args.iter().any(|arg| arg == "-F"), ssh.options().is_some());
+    }
+
+    #[test]
+    fn monitored_ssh_diagnostics_allow_controlpersist_to_detach() {
+        let mut ssh = RemoteSsh::new_noninteractive("example".into());
+        ssh.monitor = Some(super::super::SshConnectionMonitor::new(
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        ));
+        let command = ssh.command();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args
+            .windows(2)
+            .any(|args| args == ["-o", "LogLevel=DEBUG3"]));
+        assert!(!args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-v" | "-vv" | "-vvv")));
     }
 
     #[test]
