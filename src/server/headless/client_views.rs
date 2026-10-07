@@ -9,6 +9,8 @@ pub(super) struct ShellFocusTarget {
     pub(super) pane_id: crate::layout::PaneId,
 }
 
+type ClientPaneFocusSeenState = (usize, usize, Vec<(crate::layout::PaneId, bool)>);
+
 fn classify_shell_focus_transition<'a>(
     before: Option<&'a ShellFocusTarget>,
     after: Option<&'a ShellFocusTarget>,
@@ -363,6 +365,50 @@ impl HeadlessServer {
                 .as_deref()
                 .is_some_and(|tab_id| self.focus_shell_client_on_tab(client_id, tab_id)),
             _ => false,
+        }
+    }
+
+    fn client_pane_focus_seen_state(
+        &self,
+        method: &api::schema::Method,
+    ) -> Option<ClientPaneFocusSeenState> {
+        let api::schema::Method::PaneFocus(target) = method else {
+            return None;
+        };
+        let (workspace_index, pane_id) = self.app.parse_pane_id(&target.pane_id)?;
+        let workspace = self.app.state.workspaces.get(workspace_index)?;
+        let tab_index = workspace.find_tab_index_for_pane(pane_id)?;
+        let tab = workspace.tabs.get(tab_index)?;
+        Some((
+            workspace_index,
+            tab_index,
+            tab.panes
+                .iter()
+                .map(|(&pane_id, pane)| (pane_id, pane.seen))
+                .collect(),
+        ))
+    }
+
+    fn restore_client_pane_focus_seen_state(
+        &mut self,
+        seen_state: Option<ClientPaneFocusSeenState>,
+    ) {
+        let Some((workspace_index, tab_index, seen_values)) = seen_state else {
+            return;
+        };
+        let Some(tab) = self
+            .app
+            .state
+            .workspaces
+            .get_mut(workspace_index)
+            .and_then(|workspace| workspace.tabs.get_mut(tab_index))
+        else {
+            return;
+        };
+        for (pane_id, seen) in seen_values {
+            if let Some(pane) = tab.panes.get_mut(&pane_id) {
+                pane.seen = seen;
+            }
         }
     }
 
@@ -912,6 +958,12 @@ impl HeadlessServer {
         client_id: u64,
         msg: api::ApiRequestMessage,
     ) -> bool {
+        let pane_focus_seen_state = self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| client.outer_terminal_focus != Some(true))
+            .then(|| self.client_pane_focus_seen_state(&msg.request.method))
+            .flatten();
         let focus_before = self.shell_focus_target(client_id);
         let focused_tabs_before = self.focused_shell_tabs();
         let method_claims_geometry = Self::shell_endpoint_claims_geometry(&msg.request.method);
@@ -922,7 +974,11 @@ impl HeadlessServer {
         self.set_default_shell_target_from_client(client_id);
         let popup_before = self.app.state.popup_pane.is_some();
         let popup_owner = self.shell_tab_id_for_client(client_id);
+        // Client-local focus is acknowledged by the presentation after endpoint activation.
+        // Defer server seen-state changes until the client reaches the pane and its outer
+        // focus/input path confirms that the user can see it.
         let changed = self.handle_api_request_with_shutdown_check_inner(msg, false, true);
+        self.restore_client_pane_focus_seen_state(pane_focus_seen_state);
         self.focus_shell_client_on_default_target(client_id);
         if !popup_before && self.app.state.popup_pane.is_some() {
             self.popup_owner_tab_id = popup_owner;

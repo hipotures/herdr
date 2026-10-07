@@ -6,6 +6,7 @@ mod aggregate_navigation;
 mod machine_diagnostics;
 mod workspace_navigation;
 use workspace_navigation::{PendingWorkspaceHighlight, WorkspaceNavigationTarget};
+mod client_control;
 mod composition;
 mod config;
 mod context_menu;

@@ -39,6 +39,7 @@ pub(super) struct ClientState {
     pub(super) endpoint_sgr_pixels_requested: bool,
     /// Latest physical host theme observations, retained so an endpoint selected after the
     /// observation receives the same client-owned baseline.
+    pub(super) control_window_token: Option<String>,
     pub(super) host_theme_updates: Vec<crate::protocol::ClientHostThemeUpdate>,
     pub(super) direct_mouse_capture_preference: bool,
     pub(super) shell_mouse_capture_preference: bool,
@@ -102,6 +103,7 @@ impl ClientState {
             mouse_capture_active: false,
             endpoint_mouse_capture_requested: false,
             endpoint_sgr_pixels_requested: false,
+            control_window_token: None,
             host_theme_updates: Vec::new(),
             direct_mouse_capture_preference: false,
             shell_mouse_capture_preference: false,

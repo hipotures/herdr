@@ -342,13 +342,17 @@ herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [
 herdr agent send-keys <target> <key> [key ...]
 herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]
 herdr agent rename <target> <name>|--clear
-herdr agent focus <target>
+herdr agent focus <target|machine:wN:pN> [--check] [--client ID] [--expected-boot ID]
 herdr agent wait <target> [--until STATUS]... [--timeout MS]
 herdr agent attach <target> [--takeover]
 herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]
 herdr agent explain <target> [--json|--verbose]
 herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 ```
+
+Machine-qualified focus, such as `herdr agent focus GPU:w1:p3`, selects the saved machine by its unique label or stable profile ID and navigates an existing local TUI client to the pane's workspace and tab. `local:w1:p3` selects Local through the same client path. The target must still host an agent. Missing, disabled, disconnected, stale, and ambiguous targets fail explicitly. This path uses the running client's authenticated connection and reports success only after its selected pane surface is ready for input. It does not start a terminal or establish another SSH connection.
+
+Unqualified `agent focus` retains its public API routing, including inherited session/socket selection and `--machine`. For desktop integration, `--check --expected-boot BOOT` validates a target against the `boot_id` from its polled API snapshot without navigating and returns JSON containing `client_id`, `window_token`, and `boot_id`. The terminal title includes the unique `[herdr-client:ID]` marker alongside the configured title, including when title formatting is disabled. Confirm exactly one desktop window contains this marker, then submit focus with `--client ID --expected-boot BOOT`. A machine restart between validation and focus is rejected. Multiple clients fail with an ambiguity error unless `--client` selects one; Local requests also match the inherited session/socket identity. On platforms without the local control channel, qualified focus reports that it is unavailable.
 
 Agent targets are either a unique live agent name or the pane ID that currently hosts the agent. Terminal IDs and bare agent-kind labels are not agent targets. Agents started through `agent start` require a name; manually launched agents remain unnamed and use their pane ID.
 
@@ -358,7 +362,7 @@ A successful start returns only after the expected agent owns the same terminal 
 
 `agent prompt` honors live bracketed-paste mode and writes text followed by delayed Enter as one ordered submission, including while the agent is working. Success without `--wait` acknowledges the writes, not the start of a turn. On Windows, Codex receives a paste boundary before Enter so submission does not depend on prompt size; the caller timeout includes submission time. If the agent is already `blocked`, it returns `agent_blocked` without sending input. With `--wait`, a prompt sent from another non-working state has up to five seconds after submission to produce an observed `working` or `blocked` state or Herdr returns `agent_prompt_stalled`; if the caller timeout expires first, Herdr returns the normal `timeout` error. This prevents unrelated `idle`, `done`, or session changes from completing the wait. After activity is observed, it waits for the first requested settled status. It does not track individual turns. If the agent is already working, completion of that active turn may satisfy the wait. `--until` narrows the matching states and is rejected unless `--wait` is also present. Standalone `agent wait` returns immediately when the current status matches. Both default to `idle`, `done`, or `blocked`; use `--until unknown` explicitly when needed.
 
-`idle` and `done` both mean ready for input. The CLI/API uses the server's seen state: `done` is idle but not yet marked seen, explicit `pane focus` / `agent focus` commands mark the target seen, and reads do not. Each TUI client tracks viewed completions independently, so its Done badge can differ from the CLI or another client. `blocked` means Herdr recognized an approval or question UI. `unknown` means an agent is present but Herdr cannot classify it confidently, not that its work succeeded.
+`idle` and `done` both mean ready for input. The CLI/API uses the server's seen state: `done` is idle but not yet marked seen, public API `pane focus` / unqualified `agent focus` commands mark the target seen, while client-local pane navigation defers acknowledgement to presentation and outer-terminal focus, and reads do not. Each TUI client tracks viewed completions independently, so its Done badge can differ from the CLI or another client. `blocked` means Herdr recognized an approval or question UI. `unknown` means an agent is present but Herdr cannot classify it confidently, not that its work succeeded.
 
 `agent send-keys` sends logical terminal keys such as `enter`, `up`, `esc`, or `ctrl+c`. Herdr validates every key before writing any bytes. `agent read` reads the resolved terminal stream, and `agent rename` names an already detected agent.
 

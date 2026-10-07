@@ -1926,6 +1926,135 @@ async fn client_shell_tab_focus_changes_only_the_source_connection() {
 }
 
 #[tokio::test]
+async fn client_local_pane_focus_preserves_seen_until_the_client_is_focused() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("client-local-pane-focus");
+    let target_tab = workspace.test_add_tab(Some("target"));
+    let target_pane = workspace.tabs[target_tab].root_pane;
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    server.app.state.workspaces[0].tabs[target_tab]
+        .panes
+        .get_mut(&target_pane)
+        .expect("target pane")
+        .seen = false;
+    let target_pane_id = server.app.public_pane_id(0, target_pane).unwrap();
+
+    let (control, _render) = connect_matching_test_shell(&mut server, 71);
+    let _ = client_shell_snapshot(&control);
+    server.clients.get_mut(&71).unwrap().outer_terminal_focus = Some(false);
+
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellEndpointRequest {
+            client_id: 71,
+            boot_id: server.client_shell_boot_id.clone(),
+            request: Box::new(api::schema::Request {
+                id: "focus-pane".into(),
+                method: api::schema::Method::PaneFocus(api::schema::PaneTarget {
+                    pane_id: target_pane_id.clone(),
+                }),
+            }),
+        })
+    );
+    let response_ready = server
+        .server_event_rx
+        .recv()
+        .await
+        .expect("focus response ready");
+    assert!(!server.handle_server_event(response_ready));
+    let response = read_server_message(control.recv().expect("focus response"));
+    let ServerMessage::ClientShellEndpointResponseChunk { data, .. } = response else {
+        panic!("expected endpoint focus response");
+    };
+    assert!(serde_json::from_slice::<api::schema::SuccessResponse>(&data).is_ok());
+
+    assert_eq!(server.app.state.active, Some(0));
+    assert_eq!(server.app.state.workspaces[0].active_tab, target_tab);
+    assert!(!server.app.state.workspaces[0].tabs[target_tab].panes[&target_pane].seen);
+
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    assert!(
+        server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+            request: crate::api::schema::Request {
+                id: "public-focus-pane".into(),
+                method: crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
+                    pane_id: target_pane_id,
+                }),
+            },
+            respond_to,
+            response_write_complete: None,
+        })
+    );
+    let response = response_rx.recv().expect("public focus response");
+    assert!(serde_json::from_str::<api::schema::SuccessResponse>(&response).is_ok());
+    assert!(server.app.state.workspaces[0].tabs[target_tab].panes[&target_pane].seen);
+
+    server.app.state.workspaces[0].tabs[target_tab]
+        .panes
+        .get_mut(&target_pane)
+        .expect("target pane")
+        .seen = false;
+    server.clients.get_mut(&71).unwrap().outer_terminal_focus = Some(true);
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellEndpointRequest {
+            client_id: 71,
+            boot_id: server.client_shell_boot_id.clone(),
+            request: Box::new(api::schema::Request {
+                id: "focus-pane-focused-client".into(),
+                method: api::schema::Method::PaneFocus(api::schema::PaneTarget {
+                    pane_id: server.app.public_pane_id(0, target_pane).unwrap(),
+                }),
+            }),
+        })
+    );
+    let response_ready = server
+        .server_event_rx
+        .recv()
+        .await
+        .expect("focused focus response ready");
+    assert!(!server.handle_server_event(response_ready));
+    let response = read_server_message(control.recv().expect("focused focus response"));
+    let ServerMessage::ClientShellEndpointResponseChunk { data, .. } = response else {
+        panic!("expected focused endpoint focus response");
+    };
+    assert!(serde_json::from_slice::<api::schema::SuccessResponse>(&data).is_ok());
+    assert!(server.app.state.workspaces[0].tabs[target_tab].panes[&target_pane].seen);
+
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn headless_session_snapshot_includes_server_boot_id() {
+    let mut server = test_headless_server();
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    assert!(
+        !server.handle_api_request_with_shutdown_check(crate::api::ApiRequestMessage {
+            request: crate::api::schema::Request {
+                id: "session-snapshot".into(),
+                method: crate::api::schema::Method::SessionSnapshot(
+                    crate::api::schema::EmptyParams::default(),
+                ),
+            },
+            respond_to,
+            response_write_complete: None,
+        })
+    );
+    let response = response_rx.recv().expect("session snapshot response");
+    let success: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+    let crate::api::schema::ResponseResult::SessionSnapshot { snapshot } = success.result else {
+        panic!("expected session snapshot response");
+    };
+    assert_eq!(
+        snapshot.boot_id.as_deref(),
+        Some(server.client_shell_boot_id.as_str())
+    );
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
 async fn deferred_worktree_response_moves_only_its_source_client() {
     let mut server = test_headless_server();
     let mut workspace = crate::workspace::Workspace::test_new("deferred-worktree");

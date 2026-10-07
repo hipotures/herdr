@@ -456,7 +456,7 @@ impl ClientShellState {
     /// A terminal normally starts focused. `None` means this host cannot report focus events,
     /// not that the endpoint has no viewer; activation therefore sends an explicit true baseline.
     pub(crate) fn host_focus_baseline(&self) -> bool {
-        self.outer_focused.unwrap_or(true)
+        !self.control_focus_pending && self.outer_focused.unwrap_or(true)
     }
 
     pub(crate) fn endpoint_label(&self, endpoint_id: &ClientEndpointId) -> &str {
@@ -577,7 +577,10 @@ impl ClientShellState {
         self.endpoints[index]
             .agent_presentation
             .project_snapshot_for_generation(&mut snapshot, generation);
-        let presented_surface = if acknowledge_surface && endpoint_id == &self.active_endpoint_id {
+        let presented_surface = if acknowledge_surface
+            && !self.control_focus_pending
+            && endpoint_id == &self.active_endpoint_id
+        {
             self.pane_surface.as_ref()
         } else {
             None
@@ -654,6 +657,9 @@ impl ClientShellState {
     }
 
     pub(crate) fn acknowledge_active_surface_agents(&mut self, surface: &PaneSurfaceFrame) -> bool {
+        if self.control_focus_pending {
+            return false;
+        }
         let Some(index) = self
             .endpoints
             .iter()

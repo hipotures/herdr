@@ -2992,6 +2992,8 @@ impl HeadlessServer {
             self.app.state.view.terminal_area =
                 Rect::new(0, 0, self.effective_size.0, self.effective_size.1);
         }
+        let session_snapshot_requested =
+            matches!(&msg.request.method, api::schema::Method::SessionSnapshot(_));
         let mut response = if matches!(
             &msg.request.method,
             api::schema::Method::ServerReloadConfig(_)
@@ -3018,6 +3020,19 @@ impl HeadlessServer {
             self.app
                 .handle_api_request_after_internal_events_drained(msg.request)
         };
+        if session_snapshot_requested {
+            if let Ok(mut success) = serde_json::from_str::<api::schema::SuccessResponse>(&response)
+            {
+                if let api::schema::ResponseResult::SessionSnapshot { snapshot } =
+                    &mut success.result
+                {
+                    snapshot.boot_id = Some(self.client_shell_boot_id.clone());
+                    if let Ok(serialized) = serde_json::to_string(&success) {
+                        response = serialized;
+                    }
+                }
+            }
+        }
         if let Some(snapshot) = frozen_alt_screen_read {
             if let Ok(mut success) = serde_json::from_str::<api::schema::SuccessResponse>(&response)
             {

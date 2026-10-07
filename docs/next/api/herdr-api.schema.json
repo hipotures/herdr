@@ -10465,6 +10465,12 @@
               },
               "type": "array"
             },
+            "boot_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "focused_pane_id": {
               "type": [
                 "string",

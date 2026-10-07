@@ -381,7 +381,10 @@ fn agent_command() -> Command {
                         .required(true),
                 ),
         )
-        .subcommand(id_command("focus", "target", "Focus an agent"))
+        .subcommand(id_command("focus", "target", "Focus an agent or a machine-qualified pane in a running client")
+            .arg(flag("check").help("Validate client and target without changing focus; print window identity as JSON"))
+            .arg(option("client", "ID").help("Select an exact running client"))
+            .arg(option("expected-boot", "ID").help("Reject a target machine that restarted since --check")))
         .subcommand(
             Command::new("wait")
                 .about("Wait until an agent reaches one of the requested states")

@@ -4,6 +4,8 @@
 //! modules don't scatter `#[cfg]` branches through product logic.
 
 #[cfg(unix)]
+pub(crate) mod client_control_unix;
+#[cfg(unix)]
 pub(crate) mod ssh_agent;
 
 pub(crate) struct HostShutdownMonitor {

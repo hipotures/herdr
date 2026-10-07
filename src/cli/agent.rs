@@ -466,21 +466,138 @@ fn agent_get(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn agent_focus(args: &[String]) -> std::io::Result<i32> {
-    let Some(target) = args.first() else {
-        eprintln!("usage: herdr agent focus <target>");
-        return Ok(2);
+    let parsed = match parse_focus_options(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            return Ok(2);
+        }
     };
-    if args.len() != 1 {
-        eprintln!("usage: herdr agent focus <target>");
-        return Ok(2);
+    let (target, selector) = split_focus_target(&parsed.target);
+    let machine = super::target::focus_machine_id();
+    let use_client = selector.is_some() || parsed.check || parsed.client.is_some();
+    if !use_client {
+        return super::print_response(&super::send_request(&Request {
+            id: "cli:agent:focus".into(),
+            method: Method::AgentFocus(AgentTarget {
+                target: parsed.target,
+            }),
+        })?);
     }
+    let endpoint_id = match selector {
+        Some("local") => {
+            if machine.is_some() {
+                eprintln!("local qualifier conflicts with --machine");
+                return Ok(2);
+            }
+            "local".to_owned()
+        }
+        Some(selector) => {
+            let profiles = crate::client::endpoint::EndpointCatalog::load_profiles()
+                .map_err(std::io::Error::other)?;
+            let profile = match super::target::resolve_machine(&profiles, selector) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    eprintln!("{error}");
+                    return Ok(2);
+                }
+            };
+            if machine.as_ref().is_some_and(|id| id != profile.id.as_str()) {
+                eprintln!("machine qualifier conflicts with --machine");
+                return Ok(2);
+            }
+            profile.id.to_string()
+        }
+        None => machine.unwrap_or_else(|| "local".to_owned()),
+    };
+    let local_socket =
+        (endpoint_id == "local").then(crate::server::socket_paths::client_socket_path);
+    let request = crate::client::control_ipc::ClientControlRequest {
+        endpoint_id,
+        target: target.to_owned(),
+        check: parsed.check,
+        expected_boot_id: parsed.expected_boot,
+    };
+    match crate::client::control_ipc::request(
+        &request,
+        parsed.client.as_deref(),
+        local_socket.as_deref(),
+    ) {
+        Ok(reply) => {
+            println!(
+                "{}",
+                serde_json::to_string(&reply).map_err(std::io::Error::other)?
+            );
+            Ok(0)
+        }
+        Err(error) => {
+            eprintln!("Herdr client focus failed: {error}");
+            Ok(1)
+        }
+    }
+}
 
-    super::print_response(&super::send_request(&Request {
-        id: "cli:agent:focus".into(),
-        method: Method::AgentFocus(AgentTarget {
-            target: target.clone(),
-        }),
-    })?)
+struct FocusOptions {
+    target: String,
+    check: bool,
+    client: Option<String>,
+    expected_boot: Option<String>,
+}
+
+fn parse_focus_options(args: &[String]) -> Result<FocusOptions, String> {
+    let usage = "usage: herdr agent focus <target|machine:wN:pN> [--check] [--client ID] [--expected-boot ID]";
+    let target = args
+        .first()
+        .filter(|target| !target.starts_with('-'))
+        .ok_or(usage)?
+        .clone();
+    let mut parsed = FocusOptions {
+        target,
+        check: false,
+        client: None,
+        expected_boot: None,
+    };
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--check" if !parsed.check => {
+                parsed.check = true;
+                index += 1;
+            }
+            "--client" | "--expected-boot" => {
+                let field = if args[index] == "--client" {
+                    &mut parsed.client
+                } else {
+                    &mut parsed.expected_boot
+                };
+                if field.is_some() {
+                    return Err(usage.into());
+                }
+                *field = Some(
+                    args.get(index + 1)
+                        .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                        .ok_or(usage)?
+                        .clone(),
+                );
+                index += 2;
+            }
+            _ => return Err(usage.into()),
+        }
+    }
+    if parsed.expected_boot.is_some() && parsed.client.is_none() && !parsed.check {
+        return Err("--expected-boot requires --client or --check".into());
+    }
+    Ok(parsed)
+}
+
+fn split_focus_target(target: &str) -> (&str, Option<&str>) {
+    let Some((prefix, _)) = target.rsplit_once(':') else {
+        return (target, None);
+    };
+    match prefix.rfind(':') {
+        Some(index) => (&target[index + 1..], Some(&target[..index])),
+        None => (target, None),
+    }
 }
 
 fn agent_attach(args: &[String]) -> std::io::Result<i32> {
@@ -937,7 +1054,9 @@ fn print_agent_help() {
     eprintln!("  herdr agent send-keys <target> <key> [key ...]");
     eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent rename <target> <name>|--clear");
-    eprintln!("  herdr agent focus <target>");
+    eprintln!(
+        "  herdr agent focus <target|machine:wN:pN> [--check] [--client ID] [--expected-boot ID]"
+    );
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent attach <target> [--takeover]");
     eprintln!(
@@ -956,4 +1075,50 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
         eprintln!("{err}");
         2
     })
+}
+
+#[cfg(test)]
+mod focus_tests {
+    use super::*;
+
+    #[test]
+    fn focus_targets_preserve_unqualified_agent_names_and_panes() {
+        for target in ["worker", "w1:p3", "p3"] {
+            assert_eq!(split_focus_target(target), (target, None));
+        }
+        assert_eq!(split_focus_target("GPU:w1:p3"), ("w1:p3", Some("GPU")));
+        assert_eq!(split_focus_target("CPU:w2:p5"), ("w2:p5", Some("CPU")));
+        assert_eq!(
+            split_focus_target("Lab:GPU:w2:p5"),
+            ("w2:p5", Some("Lab:GPU"))
+        );
+        assert_eq!(split_focus_target("local:w1:p3"), ("w1:p3", Some("local")));
+    }
+
+    #[test]
+    fn focus_options_reject_duplicate_or_incomplete_identity() {
+        for args in [
+            vec![],
+            vec!["w1:p1", "--client"],
+            vec!["w1:p1", "--check", "--check"],
+            vec!["w1:p1", "--expected-boot", "boot"],
+        ] {
+            assert!(
+                parse_focus_options(&args.into_iter().map(str::to_owned).collect::<Vec<_>>())
+                    .is_err()
+            );
+        }
+        let args = [
+            "local:w1:p1",
+            "--check",
+            "--client",
+            "client",
+            "--expected-boot",
+            "boot",
+        ]
+        .map(str::to_owned);
+        let parsed = parse_focus_options(&args).unwrap();
+        assert!(parsed.check);
+        assert_eq!(parsed.client.as_deref(), Some("client"));
+    }
 }

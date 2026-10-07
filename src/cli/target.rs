@@ -59,6 +59,15 @@ fn usage_error(error: String) -> io::Result<super::CommandOutcome> {
     Ok(super::CommandOutcome::Handled(2))
 }
 
+pub(super) fn focus_machine_id() -> Option<String> {
+    TARGET.with(|target| {
+        target
+            .borrow()
+            .as_ref()
+            .map(|target| target.profile.id.to_string())
+    })
+}
+
 pub(super) fn is_remote() -> bool {
     TARGET.with(|target| target.borrow().is_some())
 }

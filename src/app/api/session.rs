@@ -64,6 +64,7 @@ impl App {
         SessionSnapshot {
             version: crate::build_info::version(),
             protocol: crate::protocol::PROTOCOL_VERSION,
+            boot_id: None,
             focused_workspace_id,
             focused_tab_id,
             focused_pane_id,
@@ -115,6 +116,7 @@ mod tests {
         assert_eq!(snapshot.tabs.len(), 2);
         assert_eq!(snapshot.panes.len(), 2);
         assert_eq!(snapshot.layouts.len(), 2);
+        assert_eq!(snapshot.boot_id, None);
         assert_eq!(
             snapshot.focused_workspace_id.as_deref(),
             Some(snapshot.workspaces[0].workspace_id.as_str())

@@ -17,6 +17,8 @@ mod catalog_reload;
 mod clipboard_forwarding;
 mod clipboard_images;
 mod config_reload;
+mod control_focus;
+pub(crate) mod control_ipc;
 #[cfg(unix)]
 mod direct_graphics;
 pub(crate) mod endpoint;
@@ -437,6 +439,7 @@ async fn run_client_loop(
         mouse_capture_active: config.mouse_capture_active,
         endpoint_mouse_capture_requested: false,
         endpoint_sgr_pixels_requested: false,
+        control_window_token: None,
         host_theme_updates: Vec::new(),
         direct_mouse_capture_preference: attach_escape.is_some() && config.mouse_capture_active,
         shell_mouse_capture_preference: config.mouse_capture_active,
@@ -638,6 +641,26 @@ async fn run_client_loop(
     let mut next_surface_serial = 1_u64;
     let mut pending_activation: Option<endpoint::PendingEndpointActivation> = None;
     let mut scheduled_activation = None;
+    let control = if state.shell.is_some() && !is_remote_client && state.attach_escape.is_none() {
+        match control_ipc::start(event_tx.clone(), &client_socket_path()) {
+            Ok(control) => {
+                state.control_window_token = Some(control.window_token.clone());
+                let _ = crate::terminal_effects::write_window_title(
+                    &mut io::stdout(),
+                    Some(&control.window_token),
+                );
+                Some(control)
+            }
+            Err(error) => {
+                warn!(%error, "client focus control is unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut pending_control: Option<control_focus::PendingControlFocus> = None;
+    let mut control_restore_pending = false;
     let mut pending_catalog: Option<Result<Vec<endpoint::SavedSshEndpoint>, String>> = None;
     if state.shell.is_some() && !is_remote_client && state.attach_escape.is_none() {
         catalog_reload::watch_profiles(event_tx.clone(), should_quit.clone());
@@ -652,6 +675,77 @@ async fn run_client_loop(
     #[cfg(windows)]
     let mut stdin_open = true;
     while !should_quit.load(Ordering::Acquire) {
+        if let Some(result) = pending_control.as_ref().and_then(|pending| {
+            pending.completion(
+                &state,
+                &write_stream,
+                pending_activation.is_some() || scheduled_activation.is_some(),
+                std::time::Instant::now(),
+            )
+        }) {
+            let result = result.and_then(|()| {
+                let frame = state
+                    .shell
+                    .as_mut()
+                    .and_then(|shell| shell.compose(state.reported_size.0, state.reported_size.1))
+                    .ok_or_else(|| "Selected agent surface cannot be composed".to_owned())?;
+                if state.try_present_frame(frame) {
+                    Ok(())
+                } else {
+                    Err("Selected agent surface could not be written to the terminal".into())
+                }
+            });
+            if result.is_ok() {
+                let focused = state
+                    .shell
+                    .as_mut()
+                    .expect("control client shell")
+                    .client_control_finish(true);
+                if write_stream.active_surface_available() {
+                    write_stream.send(&ClientMessage::ClientShellFocus { focused });
+                }
+            } else {
+                if let Some(error) = result.as_ref().err() {
+                    rollback_endpoint_activation(
+                        &mut state,
+                        &mut write_stream,
+                        &mut pending_activation,
+                        error.clone(),
+                        false,
+                    );
+                }
+                if matches!(
+                    scheduled_activation,
+                    Some(ClientLoopEvent::ActivateEndpoint { .. })
+                ) {
+                    scheduled_activation = None;
+                }
+                control_restore_pending = true;
+            }
+            pending_control
+                .take()
+                .expect("checked pending focus")
+                .finish(result);
+        }
+        if control_restore_pending
+            && pending_activation.is_none()
+            && !state.presentation_frozen
+            && write_stream.active_surface_available()
+        {
+            let frame = state
+                .shell
+                .as_mut()
+                .and_then(|shell| shell.compose(state.reported_size.0, state.reported_size.1));
+            if frame.is_some_and(|frame| state.try_present_frame(frame)) {
+                control_restore_pending = false;
+                let focused = state
+                    .shell
+                    .as_mut()
+                    .expect("control client shell")
+                    .client_control_finish(true);
+                write_stream.send(&ClientMessage::ClientShellFocus { focused });
+            }
+        }
         if pending_activation.is_none() {
             if let Some(reload) = pending_catalog.take() {
                 match reload {
@@ -799,6 +893,106 @@ async fn run_client_loop(
         }
 
         match event {
+            ClientLoopEvent::ClientControl(message) => {
+                if message.reply.is_closed() {
+                    continue;
+                }
+                let result = (|| {
+                    if control_restore_pending
+                        || pending_control.is_some()
+                        || pending_activation.is_some()
+                        || scheduled_activation.is_some()
+                    {
+                        return Err(
+                            "This client is busy switching or focusing a machine".to_owned()
+                        );
+                    }
+                    let endpoint_id = if message.request.endpoint_id == "local" {
+                        endpoint::ClientEndpointId::Local
+                    } else {
+                        let profile_id = endpoint::ProfileId::parse(&message.request.endpoint_id)?;
+                        if !endpoint_catalog
+                            .ssh
+                            .iter()
+                            .any(|profile| profile.id == profile_id && profile.enabled)
+                        {
+                            return Err(
+                                "Requested machine is missing or disabled in this client".into()
+                            );
+                        }
+                        endpoint::ClientEndpointId::Ssh(profile_id)
+                    };
+                    let shell = state
+                        .shell
+                        .as_ref()
+                        .ok_or("This client does not have a navigation surface")?;
+                    let target = shell.client_control_target(
+                        &endpoint_id,
+                        &message.request.target,
+                        message.request.expected_boot_id.as_deref(),
+                    )?;
+                    if !write_stream.accepts(&endpoint_id, target.generation) {
+                        return Err("Target machine connection is stale".into());
+                    }
+                    Ok(target)
+                })();
+                let target = match result {
+                    Ok(target) => target,
+                    Err(error) => {
+                        let _ = message.reply.send(Err(error));
+                        continue;
+                    }
+                };
+                let Some(control) = control.as_ref() else {
+                    let _ = message
+                        .reply
+                        .send(Err("Client focus control is unavailable".into()));
+                    continue;
+                };
+                let identity = control_ipc::ClientControlReply {
+                    client_id: control.client_id.clone(),
+                    window_token: control.window_token.clone(),
+                    boot_id: target.boot_id.clone(),
+                };
+                if message.request.check {
+                    let _ = message.reply.send(Ok(identity));
+                    continue;
+                }
+                let outcome = state
+                    .shell
+                    .as_mut()
+                    .expect("validated client shell")
+                    .client_control_focus(&target);
+                if outcome.actions.is_empty() {
+                    state
+                        .shell
+                        .as_mut()
+                        .expect("validated client shell")
+                        .client_control_finish(false);
+                    let _ = message
+                        .reply
+                        .send(Err("The client could not dispatch pane focus".into()));
+                    continue;
+                }
+                if write_stream.active_surface_available() {
+                    write_stream.send(&ClientMessage::ClientShellFocus { focused: false });
+                }
+                pending_control = Some(control_focus::PendingControlFocus::new(
+                    target,
+                    message.reply,
+                    identity,
+                    &outcome,
+                    now,
+                ));
+                dispatch_client_shell_actions(
+                    outcome.actions,
+                    &mut endpoint_commands,
+                    &mut write_stream,
+                    state.shell.as_mut(),
+                    &mut state.detached_process_children,
+                    &mut scheduled_activation,
+                )?;
+            }
             ClientLoopEvent::EndpointCatalog(reload) => pending_catalog = Some(reload),
             #[cfg(unix)]
             ClientLoopEvent::StdinInput(data) => {
@@ -1936,6 +2130,9 @@ async fn run_client_loop(
                         let Some(completed) = completed else {
                             continue;
                         };
+                        if let Some(pending) = pending_control.as_mut() {
+                            pending.receive_result(&completed);
+                        }
                         let (repaint, actions) = state.shell.as_mut().map_or_else(
                             || (false, Vec::new()),
                             |shell| {
@@ -2022,6 +2219,13 @@ async fn run_client_loop(
                         let _ = io::stdout().flush();
                     }
                     ServerMessage::WindowTitle { title } => {
+                        let title = control.as_ref().map_or(title.clone(), |control| {
+                            Some(format!(
+                                "{} {}",
+                                title.as_deref().unwrap_or("Herdr"),
+                                control.window_token
+                            ))
+                        });
                         let _ = crate::terminal_effects::write_window_title(
                             &mut io::stdout(),
                             title.as_deref(),

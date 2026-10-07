@@ -2,6 +2,7 @@ use super::*;
 
 /// Internal events for the client event loop.
 pub(super) enum ClientLoopEvent {
+    ClientControl(super::control_ipc::ControlMessage),
     ReconnectEndpoint(super::endpoint::ClientEndpointId),
     CancelEndpointConnection(super::endpoint::ClientEndpointId),
     #[cfg(unix)]

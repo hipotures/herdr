@@ -70,6 +70,294 @@ fn test_snapshot(boot_id: &str, revision: u64) -> crate::protocol::ClientShellSn
     }
 }
 
+fn control_workspace(
+    workspace_id: &str,
+    active_tab_id: &str,
+    focused: bool,
+) -> crate::protocol::ClientShellWorkspace {
+    crate::protocol::ClientShellWorkspace {
+        workspace_id: workspace_id.into(),
+        active_tab_id: active_tab_id.into(),
+        new_workspace_cwd: "/repo".into(),
+        number: 1,
+        label: workspace_id.into(),
+        custom_label: false,
+        branch: None,
+        git_ahead_behind: None,
+        tokens: Vec::new(),
+        worktree: None,
+        focused,
+        agent_status: crate::api::schema::AgentStatus::Unknown,
+    }
+}
+
+fn control_tab(tab_id: &str, workspace_id: &str, focused: bool) -> crate::protocol::ClientShellTab {
+    crate::protocol::ClientShellTab {
+        tab_id: tab_id.into(),
+        workspace_id: workspace_id.into(),
+        number: 1,
+        label: tab_id.into(),
+        custom_label: false,
+        zoomed: false,
+        focused,
+        agent_status: crate::api::schema::AgentStatus::Unknown,
+    }
+}
+
+fn control_pane(
+    pane_id: &str,
+    workspace_id: &str,
+    tab_id: &str,
+    focused: bool,
+) -> crate::protocol::ClientShellPane {
+    crate::protocol::ClientShellPane {
+        pane_id: pane_id.into(),
+        workspace_id: workspace_id.into(),
+        tab_id: tab_id.into(),
+        label: None,
+        cwd: Some("/repo".into()),
+        foreground_cwd: Some("/repo".into()),
+        focused,
+        right_click_passthrough: false,
+    }
+}
+
+fn control_snapshot(
+    boot_id: &str,
+    revision: u64,
+    focused_workspace_id: &str,
+    focused_tab_id: &str,
+    focused_pane_id: &str,
+    agent_workspace_id: &str,
+    agent_tab_id: &str,
+) -> crate::protocol::ClientShellSnapshot {
+    let mut snapshot = test_snapshot(boot_id, revision);
+    snapshot.focused_workspace_id = Some(focused_workspace_id.into());
+    snapshot.focused_tab_id = Some(focused_tab_id.into());
+    snapshot.focused_pane_id = Some(focused_pane_id.into());
+    snapshot.workspaces = vec![control_workspace(
+        focused_workspace_id,
+        focused_tab_id,
+        true,
+    )];
+    if agent_workspace_id != focused_workspace_id {
+        snapshot
+            .workspaces
+            .push(control_workspace(agent_workspace_id, agent_tab_id, false));
+    }
+    snapshot.tabs = vec![control_tab(focused_tab_id, focused_workspace_id, true)];
+    if agent_tab_id != focused_tab_id {
+        snapshot
+            .tabs
+            .push(control_tab(agent_tab_id, agent_workspace_id, false));
+    }
+    snapshot.panes = vec![control_pane(
+        focused_pane_id,
+        focused_workspace_id,
+        focused_tab_id,
+        true,
+    )];
+    if focused_pane_id != "agent-pane" {
+        snapshot.panes.push(control_pane(
+            "agent-pane",
+            agent_workspace_id,
+            agent_tab_id,
+            false,
+        ));
+    }
+    snapshot.agents = vec![crate::protocol::ClientShellAgent {
+        pane_id: "agent-pane".into(),
+        workspace_id: agent_workspace_id.into(),
+        tab_id: agent_tab_id.into(),
+        name: Some("gpu-codex".into()),
+        display_agent: Some("Codex".into()),
+        agent: Some("codex".into()),
+        title: None,
+        terminal_title: None,
+        terminal_title_stripped: None,
+        agent_status: crate::api::schema::AgentStatus::Working,
+        state_change_seq: revision,
+        state_labels: Vec::new(),
+        tokens: Vec::new(),
+        focused: focused_pane_id == "agent-pane",
+    }];
+    snapshot
+}
+
+fn pane_focus_result(
+    pane_id: &str,
+    workspace_id: &str,
+    tab_id: &str,
+    focused: bool,
+) -> crate::api::schema::ResponseResult {
+    crate::api::schema::ResponseResult::PaneInfo {
+        pane: crate::api::schema::PaneInfo {
+            pane_id: pane_id.into(),
+            terminal_id: "terminal".into(),
+            workspace_id: workspace_id.into(),
+            tab_id: tab_id.into(),
+            focused,
+            cwd: None,
+            foreground_cwd: None,
+            restore_error: None,
+            label: None,
+            agent: Some("codex".into()),
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            display_agent: Some("Codex".into()),
+            agent_status: crate::api::schema::AgentStatus::Working,
+            state_labels: std::collections::HashMap::new(),
+            tokens: std::collections::HashMap::new(),
+            agent_session: None,
+            scroll: None,
+            revision: 0,
+        },
+    }
+}
+
+fn pane_focus_response(
+    id: &str,
+    pane_id: &str,
+    workspace_id: &str,
+    tab_id: &str,
+    focused: bool,
+) -> Vec<u8> {
+    serde_json::to_vec(&crate::api::schema::SuccessResponse {
+        id: id.into(),
+        result: pane_focus_result(pane_id, workspace_id, tab_id, focused),
+    })
+    .unwrap()
+}
+
+fn endpoint_request_id(sent: &SentMessages, prefix: &str) -> String {
+    sent.lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|message| {
+            let crate::protocol::ClientMessage::ClientShellEndpointRequest { request, .. } =
+                message
+            else {
+                return None;
+            };
+            let request: crate::api::schema::Request = serde_json::from_str(request).ok()?;
+            request.id.starts_with(prefix).then_some(request.id)
+        })
+        .unwrap_or_else(|| panic!("missing endpoint request with prefix {prefix:?}"))
+}
+
+type ControlHandoffFixture = (
+    crate::client::ClientShellState,
+    EndpointRegistry,
+    SentMessages,
+    SentMessages,
+    ClientEndpointId,
+    crate::client::control_focus::PendingControlFocus,
+    tokio::sync::oneshot::Receiver<Result<crate::client::control_ipc::ClientControlReply, String>>,
+    PendingEndpointActivation,
+    String,
+);
+
+fn control_handoff_fixture() -> ControlHandoffFixture {
+    let (mut shell, mut endpoints, local_sent, remote_sent) = shell_and_registry();
+    let target = endpoint();
+    shell.set_endpoint_methods_for(&ClientEndpointId::Local, Some(vec!["pane.focus".into()]));
+    shell.set_endpoint_methods_for(&target, Some(vec!["pane.focus".into()]));
+    shell.set_endpoint_snapshot_for_generation(
+        &ClientEndpointId::Local,
+        1,
+        Box::new(control_snapshot(
+            "local-boot",
+            1,
+            "local-workspace",
+            "local-tab",
+            "agent-pane",
+            "local-workspace",
+            "local-tab",
+        )),
+    );
+    shell.set_endpoint_snapshot_for_generation(
+        &target,
+        7,
+        Box::new(control_snapshot(
+            "remote-boot",
+            1,
+            "gpu-other-workspace",
+            "gpu-other-tab",
+            "other-pane",
+            "gpu-target-workspace",
+            "gpu-target-tab",
+        )),
+    );
+    shell.set_pane_surface(surface("local-boot", 1, "agent-pane"));
+
+    let control_target = shell
+        .client_control_target(&target, "gpu-codex", Some("remote-boot"))
+        .unwrap();
+    let outcome = shell.client_control_focus(&control_target);
+    let [crate::client::shell::ClientShellAction::ActivateEndpoint {
+        endpoint_id,
+        target: Some(focus),
+    }] = outcome.actions.as_slice()
+    else {
+        panic!("remote control focus must start endpoint activation");
+    };
+    assert_eq!(endpoint_id, &target);
+    assert_eq!(
+        focus,
+        &crate::client::shell::ClientEndpointFocusTarget::Pane("agent-pane".into())
+    );
+    let focus = focus.clone();
+    let (reply, receiver) = tokio::sync::oneshot::channel();
+    let pending_control = crate::client::control_focus::PendingControlFocus::new(
+        control_target,
+        reply,
+        crate::client::control_ipc::ClientControlReply {
+            client_id: "test-client".into(),
+            window_token: "test-window".into(),
+            boot_id: "remote-boot".into(),
+        },
+        &outcome,
+        Instant::now(),
+    );
+    let activation = PendingEndpointActivation::prepare(
+        &shell,
+        &endpoints,
+        target.clone(),
+        Some(focus),
+        resize(),
+        30,
+        Instant::now(),
+    )
+    .unwrap()
+    .start(&mut endpoints)
+    .unwrap();
+    let mut activation = activation;
+    assert_eq!(
+        activation.receive_response(
+            &ClientEndpointId::Local,
+            1,
+            "client-shell-surface:30:off",
+            &surface_success("client-shell-surface:30:off", false, 1),
+            &mut endpoints,
+        ),
+        SurfaceActivationProgress::Pending
+    );
+    let focus_request_id = endpoint_request_id(&remote_sent, "client-shell-focus:30:");
+    (
+        shell,
+        endpoints,
+        local_sent,
+        remote_sent,
+        target,
+        pending_control,
+        receiver,
+        activation,
+        focus_request_id,
+    )
+}
+
 type SentMessages = std::sync::Arc<std::sync::Mutex<Vec<crate::protocol::ClientMessage>>>;
 type TestFixture = (
     crate::client::ClientShellState,
@@ -282,6 +570,467 @@ fn source_off_request_is_distinct_and_precedes_target_on_phase() {
         "remote-boot",
         "client-shell-surface:9:on"
     ));
+}
+
+#[test]
+fn client_control_focus_completes_remote_handoff_on_the_exact_agent_surface() {
+    let (
+        mut shell,
+        mut endpoints,
+        _local_sent,
+        remote_sent,
+        remote,
+        mut pending_control,
+        _reply,
+        mut activation,
+        focus_request_id,
+    ) = control_handoff_fixture();
+
+    assert_eq!(
+        activation.receive_response(
+            &remote,
+            7,
+            "client-shell-surface:30:on",
+            &surface_success("client-shell-surface:30:on", true, 1),
+            &mut endpoints,
+        ),
+        SurfaceActivationProgress::Pending
+    );
+    let focus_request = remote_sent
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|message| {
+            let crate::protocol::ClientMessage::ClientShellEndpointRequest { request, .. } =
+                message
+            else {
+                return None;
+            };
+            let request: crate::api::schema::Request = serde_json::from_str(request).ok()?;
+            (request.id == focus_request_id).then_some(request)
+        })
+        .expect("activation must send the selected pane focus request");
+    assert!(matches!(
+        focus_request.method,
+        crate::api::schema::Method::PaneFocus(params) if params.pane_id == "agent-pane"
+    ));
+    assert_eq!(
+        activation.receive_response(
+            &remote,
+            7,
+            &focus_request_id,
+            &pane_focus_response(
+                &focus_request_id,
+                "agent-pane",
+                "gpu-target-workspace",
+                "gpu-target-tab",
+                true,
+            ),
+            &mut endpoints,
+        ),
+        SurfaceActivationProgress::Pending
+    );
+    pending_control.receive_result(&crate::client::endpoint_commands::EndpointCommandResult {
+        endpoint_id: remote.clone(),
+        generation: 7,
+        boot_id: "remote-boot".into(),
+        request_id: focus_request_id.clone(),
+        result: Ok(pane_focus_result(
+            "agent-pane",
+            "gpu-target-workspace",
+            "gpu-target-tab",
+            true,
+        )),
+    });
+
+    let focused_snapshot = control_snapshot(
+        "remote-boot",
+        2,
+        "gpu-target-workspace",
+        "gpu-target-tab",
+        "agent-pane",
+        "gpu-target-workspace",
+        "gpu-target-tab",
+    );
+    shell.set_endpoint_snapshot_for_generation(&remote, 7, Box::new(focused_snapshot.clone()));
+    assert_eq!(
+        activation.receive_snapshot(&remote, 7, &focused_snapshot),
+        SurfaceActivationProgress::Pending
+    );
+    assert_eq!(
+        activation.receive_surface(&remote, 7, surface("remote-boot", 2, "agent-pane")),
+        SurfaceActivationProgress::Ready
+    );
+    assert!(matches!(
+        activation.complete(&mut shell, &mut endpoints),
+        Ok(ActivationCompletion::AwaitingPresentationSync {
+            previous: ClientEndpointId::Local,
+            endpoint: endpoint_id,
+        }) if endpoint_id == remote
+    ));
+    assert_eq!(endpoints.active_id(), &remote);
+    assert!(shell.endpoint_is_active(&remote));
+
+    let sync_id = "client-shell-surface:30:presentation-sync";
+    assert_eq!(
+        activation.receive_response(
+            &remote,
+            7,
+            sync_id,
+            &surface_success(sync_id, true, 2),
+            &mut endpoints,
+        ),
+        SurfaceActivationProgress::Pending
+    );
+    assert_eq!(
+        activation.receive_snapshot(&remote, 7, &focused_snapshot),
+        SurfaceActivationProgress::Pending
+    );
+    assert_eq!(
+        activation.receive_surface(&remote, 7, surface("remote-boot", 2, "agent-pane")),
+        SurfaceActivationProgress::Ready
+    );
+    assert_eq!(
+        activation.complete(&mut shell, &mut endpoints),
+        Ok(ActivationCompletion::AwaitingPresentationEffects)
+    );
+    assert_eq!(
+        activation.receive_presentation_effects_ready(&remote, 7, "30:7:remote-boot"),
+        SurfaceActivationProgress::Ready
+    );
+    assert_eq!(
+        activation.complete(&mut shell, &mut endpoints),
+        Ok(ActivationCompletion::Activated)
+    );
+    assert!(shell.endpoint_is_active(&remote));
+    let final_target = shell
+        .client_control_target(&remote, "gpu-codex", Some("remote-boot"))
+        .unwrap();
+    assert!(shell.client_control_surface_ready(&final_target));
+    endpoints.unfreeze_input();
+
+    let mut state = crate::client::ClientState::test_new();
+    state.shell = Some(shell);
+    assert_eq!(
+        pending_control.completion(&state, &endpoints, false, Instant::now()),
+        Some(Ok(()))
+    );
+    assert!(
+        state.shell.as_mut().unwrap().client_control_finish(true),
+        "presented control focus should acknowledge the selected agent surface"
+    );
+}
+
+#[test]
+fn rejected_remote_focus_does_not_complete_or_fallback_to_local() {
+    let (
+        shell,
+        mut endpoints,
+        _local_sent,
+        remote_sent,
+        remote,
+        pending_control,
+        _reply,
+        mut activation,
+        focus_request_id,
+    ) = control_handoff_fixture();
+
+    assert_eq!(
+        activation.receive_response(
+            &remote,
+            7,
+            "client-shell-surface:30:on",
+            &surface_success("client-shell-surface:30:on", true, 1),
+            &mut endpoints,
+        ),
+        SurfaceActivationProgress::Pending
+    );
+    assert_eq!(
+        activation.receive_response(
+            &remote,
+            7,
+            &focus_request_id,
+            &pane_focus_response(
+                &focus_request_id,
+                "agent-pane",
+                "gpu-target-workspace",
+                "gpu-target-tab",
+                false,
+            ),
+            &mut endpoints,
+        ),
+        SurfaceActivationProgress::Rejected {
+            message: "endpoint focus returned an unexpected result".into(),
+            source_release_rejected: false,
+        }
+    );
+    assert_eq!(endpoints.active_id(), &ClientEndpointId::Local);
+    assert!(shell.endpoint_is_active(&ClientEndpointId::Local));
+    assert!(
+        remote_sent.lock().unwrap().iter().any(|message| {
+            let crate::protocol::ClientMessage::ClientShellEndpointRequest { request, .. } =
+                message
+            else {
+                return false;
+            };
+            serde_json::from_str::<crate::api::schema::Request>(request)
+                .is_ok_and(|request| request.id == focus_request_id)
+        }),
+        "the rejected focus request must have reached the target endpoint"
+    );
+    let mut state = crate::client::ClientState::test_new();
+    state.shell = Some(shell);
+    assert!(!matches!(
+        pending_control.completion(&state, &endpoints, true, Instant::now()),
+        Some(Ok(()))
+    ));
+}
+
+#[test]
+fn dropped_control_caller_rolls_back_uncommitted_remote_activation() {
+    let (
+        shell,
+        mut endpoints,
+        local_sent,
+        remote_sent,
+        remote,
+        pending_control,
+        receiver,
+        activation,
+        _focus_request_id,
+    ) = control_handoff_fixture();
+    drop(receiver);
+
+    let mut state = crate::client::ClientState::test_new();
+    state.shell = Some(shell);
+    let mut pending_activation = Some(activation);
+    let result = pending_control
+        .completion(
+            &state,
+            &endpoints,
+            pending_activation.is_some(),
+            Instant::now(),
+        )
+        .expect("a dropped control caller must fail before activation commits");
+    assert!(matches!(result, Err(message) if message == "Focus caller disconnected"));
+    assert!(pending_activation.is_some());
+    assert_eq!(endpoints.active_id(), &ClientEndpointId::Local);
+
+    assert_eq!(
+        pending_activation.as_mut().unwrap().rollback(
+            &mut endpoints,
+            "focus caller disconnected".into(),
+            false
+        ),
+        ActivationRollback::Pending
+    );
+    assert_eq!(endpoints.active_id(), &ClientEndpointId::Local);
+    assert_eq!(
+        remote_sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(surface_set_active)
+            .collect::<Vec<_>>(),
+        vec![true, false],
+        "an uncommitted target must be released before source restoration"
+    );
+    assert_eq!(
+        pending_activation.as_mut().unwrap().receive_response(
+            &remote,
+            7,
+            "client-shell-surface:30:rollback-target-off",
+            &surface_success("client-shell-surface:30:rollback-target-off", false, 1),
+            &mut endpoints,
+        ),
+        SurfaceActivationProgress::Pending
+    );
+    assert_eq!(
+        local_sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(surface_set_active)
+            .collect::<Vec<_>>(),
+        vec![false, true],
+        "rollback must restore the original source after target release"
+    );
+    assert_eq!(endpoints.active_id(), &ClientEndpointId::Local);
+}
+
+#[test]
+fn local_reverse_activation_disambiguates_duplicate_pane_id_after_remote_selection() {
+    let (mut shell, mut endpoints, local_sent, _remote_sent) = shell_and_registry();
+    let remote = endpoint();
+    shell.set_endpoint_methods_for(&ClientEndpointId::Local, Some(vec!["pane.focus".into()]));
+    shell.set_endpoint_methods_for(&remote, Some(vec!["pane.focus".into()]));
+    shell.set_endpoint_snapshot_for_generation(
+        &ClientEndpointId::Local,
+        1,
+        Box::new(control_snapshot(
+            "local-boot",
+            1,
+            "local-other-workspace",
+            "local-other-tab",
+            "local-other-pane",
+            "local-target-workspace",
+            "local-target-tab",
+        )),
+    );
+    shell.set_endpoint_snapshot_for_generation(
+        &remote,
+        7,
+        Box::new(control_snapshot(
+            "remote-boot",
+            1,
+            "remote-workspace",
+            "remote-tab",
+            "agent-pane",
+            "remote-workspace",
+            "remote-tab",
+        )),
+    );
+    assert!(shell.activate_endpoint_projection(&remote));
+    shell.set_pane_surface(surface("remote-boot", 1, "agent-pane"));
+    endpoints.set_surface_active(&ClientEndpointId::Local, false);
+    endpoints.set_surface_active(&remote, true);
+    assert!(endpoints.set_active(&remote));
+
+    let control_target = shell
+        .client_control_target(&ClientEndpointId::Local, "agent-pane", Some("local-boot"))
+        .unwrap();
+    let outcome = shell.client_control_focus(&control_target);
+    let [crate::client::shell::ClientShellAction::ActivateEndpoint {
+        endpoint_id,
+        target: Some(crate::client::shell::ClientEndpointFocusTarget::Pane(pane_id)),
+    }] = outcome.actions.as_slice()
+    else {
+        panic!("local selection must enter the endpoint activation path");
+    };
+    assert_eq!(endpoint_id, &ClientEndpointId::Local);
+    assert_eq!(pane_id, "agent-pane");
+
+    let mut activation = PendingEndpointActivation::prepare(
+        &shell,
+        &endpoints,
+        ClientEndpointId::Local,
+        Some(crate::client::shell::ClientEndpointFocusTarget::Pane(
+            "agent-pane".into(),
+        )),
+        resize(),
+        31,
+        Instant::now(),
+    )
+    .unwrap()
+    .start(&mut endpoints)
+    .unwrap();
+    assert_eq!(
+        activation.receive_response(
+            &ClientEndpointId::Local,
+            1,
+            "client-shell-surface:31:on",
+            &surface_success("client-shell-surface:31:on", true, 1),
+            &mut endpoints,
+        ),
+        SurfaceActivationProgress::Pending
+    );
+    let focus_request_id = endpoint_request_id(&local_sent, "client-shell-focus:31:");
+    assert_eq!(
+        activation.receive_response(
+            &ClientEndpointId::Local,
+            1,
+            &focus_request_id,
+            &pane_focus_response(
+                &focus_request_id,
+                "agent-pane",
+                "local-target-workspace",
+                "local-target-tab",
+                true,
+            ),
+            &mut endpoints,
+        ),
+        SurfaceActivationProgress::Pending
+    );
+
+    let focused_snapshot = control_snapshot(
+        "local-boot",
+        2,
+        "local-target-workspace",
+        "local-target-tab",
+        "agent-pane",
+        "local-target-workspace",
+        "local-target-tab",
+    );
+    shell.set_endpoint_snapshot_for_generation(
+        &ClientEndpointId::Local,
+        1,
+        Box::new(focused_snapshot.clone()),
+    );
+    assert_eq!(
+        activation.receive_snapshot(&ClientEndpointId::Local, 1, &focused_snapshot),
+        SurfaceActivationProgress::Pending
+    );
+    assert_eq!(
+        activation.receive_surface(
+            &ClientEndpointId::Local,
+            1,
+            surface("local-boot", 2, "agent-pane"),
+        ),
+        SurfaceActivationProgress::Ready
+    );
+    assert!(matches!(
+        activation.complete(&mut shell, &mut endpoints),
+        Ok(ActivationCompletion::AwaitingPresentationSync {
+            previous: previous_id,
+            endpoint: ClientEndpointId::Local,
+        }) if previous_id == remote
+    ));
+    let sync_id = "client-shell-surface:31:presentation-sync";
+    assert_eq!(
+        activation.receive_response(
+            &ClientEndpointId::Local,
+            1,
+            sync_id,
+            &surface_success(sync_id, true, 2),
+            &mut endpoints,
+        ),
+        SurfaceActivationProgress::Pending
+    );
+    assert_eq!(
+        activation.receive_snapshot(&ClientEndpointId::Local, 1, &focused_snapshot),
+        SurfaceActivationProgress::Pending
+    );
+    assert_eq!(
+        activation.receive_surface(
+            &ClientEndpointId::Local,
+            1,
+            surface("local-boot", 2, "agent-pane"),
+        ),
+        SurfaceActivationProgress::Ready
+    );
+    assert_eq!(
+        activation.complete(&mut shell, &mut endpoints),
+        Ok(ActivationCompletion::AwaitingPresentationEffects)
+    );
+    assert_eq!(
+        activation.receive_presentation_effects_ready(
+            &ClientEndpointId::Local,
+            1,
+            "31:1:local-boot",
+        ),
+        SurfaceActivationProgress::Ready
+    );
+    assert_eq!(
+        activation.complete(&mut shell, &mut endpoints),
+        Ok(ActivationCompletion::Activated)
+    );
+    assert_eq!(endpoints.active_id(), &ClientEndpointId::Local);
+    assert!(shell.endpoint_is_active(&ClientEndpointId::Local));
+    let final_target = shell
+        .client_control_target(&ClientEndpointId::Local, "agent-pane", Some("local-boot"))
+        .unwrap();
+    assert!(shell.client_control_surface_ready(&final_target));
 }
 
 #[test]

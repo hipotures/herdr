@@ -134,7 +134,10 @@ pub(super) fn clear_endpoint_host_effects(
 
     state.pane_keyboard_report_all = false;
     let _ = sync_client_shell_keyboard_report_all(state);
-    let _ = crate::terminal_effects::write_window_title(&mut std::io::stdout(), None);
+    let _ = crate::terminal_effects::write_window_title(
+        &mut std::io::stdout(),
+        state.control_window_token.as_deref(),
+    );
 }
 
 pub(super) fn apply_client_shell_input_source_changes(
@@ -775,6 +778,11 @@ pub(super) fn finish_client_shell_input(
         // Host focus belongs to a pending target even when the source has gone offline or has
         // already had its surface revoked. Route it before the ordinary source-online gate.
         if let ClientMessage::ClientShellFocus { focused } = request {
+            let focused = focused
+                && !state
+                    .shell
+                    .as_ref()
+                    .is_some_and(|shell| shell.client_control_is_pending());
             if let Some(activation) = pending_activation.as_mut() {
                 if let Err(error) = activation.update_host_focus(focused, endpoints) {
                     rollback_endpoint_activation(
