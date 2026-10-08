@@ -80,6 +80,36 @@ just test        # unit tests
 just check       # formatting, tests, and maintenance checks
 ```
 
+## Custom fork installation package
+
+The installer source lives in `packaging/linux/`, and the package builder is
+`scripts/package_focus.py`. Build and package this checkout with:
+
+```bash
+just build
+just package-focus
+```
+
+The stable output is `dist/herdr-focus-linux-x86_64.tar.gz`, with a checksum
+alongside it. Build metadata stays inside the archive. To package an existing
+binary instead, use `just package-focus --binary /path/to/herdr`.
+
+On each target machine, extract and install:
+
+```bash
+tar -xzf herdr-focus-linux-x86_64.tar.gz
+bash herdr-focus/install.sh --handoff
+```
+
+The Linux x86-64 installer checks the packaged binary before atomic replacement
+and uses the existing live-handoff mechanism for the default session. Use
+`--session NAME` with `--handoff` for another session. Run without `--handoff`
+to replace only the binary. Live handoff transfers the running pane processes
+and is experimental. The installer never calls `server stop`.
+
+Generated packages stay in the application checkout's `dist/` directory and
+are ignored by Git; the builder, installer, documentation, and tests are tracked.
+
 ## license
 
 Herdr is licensed under the [Apache License 2.0](LICENSE).
