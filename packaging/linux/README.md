@@ -18,7 +18,19 @@ atomically replacing `~/.local/bin/herdr`. Use `--bin-dir PATH` for another
 installation directory. Existing Herdr processes keep running because the
 replacement is an atomic rename.
 
+For this patched build, use this archive instead of `herdr update` or
+`herdr update --handoff`, which download official binaries and can overwrite
+the patches. Replacing the file alone does not update an already running server.
+
 Live handoff is explicit:
+
+Before using it with a supervised server, check the supervisor configuration.
+A systemd service with `ExitType=main` and `KillMode=control-group` terminates
+the replacement server when the old main process exits, even after Herdr reports
+a successful handoff. Configure and test suitable supervision before updating
+live sessions; do not restart the live service to apply changes. Remove any
+automatic `herdr update` command from its `ExecStartPre` to preserve this fork's
+binary on subsequent service starts.
 
 ```bash
 bash herdr-focus/install.sh --handoff
@@ -27,9 +39,24 @@ bash herdr-focus/install.sh --handoff --session SESSION_NAME
 
 The optional, experimental handoff transfers live panes to the newly installed
 server. The installer never runs `server stop`; if handoff fails, it reports
-the failure and does not retry through another command. Run the installer separately on
-each remote Herdr machine whose agents should be reachable from the GNOME
-Codex Status widget.
+the failure and does not retry through another command. Select each running
+session that needs the new server code separately. Start a new client to use
+updated client code as well.
+
+If the new binary is already installed, hand off the default session directly:
+
+```bash
+~/.local/bin/herdr server live-handoff --import-exe "$HOME/.local/bin/herdr"
+~/.local/bin/herdr status server
+```
+
+For another session, add `--session SESSION_NAME` before `server` and `status`.
+This uses your local binary without downloading an official release. Always
+specify `--import-exe`: after atomic replacement, the old server's executable
+path may end in `(deleted)` and cannot be started again by that path.
+`herdr --version` reports the installed binary; `herdr status server` inspects
+the running server. Do not use `server stop` or `session stop` as an update
+fallback, because they end pane processes.
 
 Build this package from the repository with:
 

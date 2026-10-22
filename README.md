@@ -82,6 +82,12 @@ just check       # formatting, tests, and maintenance checks
 
 ## Custom fork installation package
 
+See [Install and update the patched Herdr build](INSTALL-UPDATE.md) for first
+installation, updating a running server without stopping pane processes, and
+recovering from a handoff executable path ending in `(deleted)`.
+Check the service-supervision requirements there before using live handoff:
+systemd can terminate the replacement server after the old main process exits.
+
 The installer source lives in `packaging/linux/`, and the package builder is
 `scripts/package_focus.py`. Build and package this checkout with:
 
