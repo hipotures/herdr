@@ -26,8 +26,17 @@ pub(crate) use super::unix_common::{
 mod bootstrap;
 pub(crate) use bootstrap::{configure_server_daemon_context, prepare_server_process};
 
+mod shutdown;
+pub(crate) use shutdown::monitor_host_shutdown;
+
 #[cfg(test)]
 mod config_file_tests;
+
+#[cfg(test)]
+mod input_tests;
+
+mod input;
+pub(crate) use input::PtyInputGuard;
 
 pub(crate) fn config_file_link_count(path: &Path) -> std::io::Result<u64> {
     use std::os::unix::fs::MetadataExt;
@@ -910,6 +919,30 @@ fn run_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
     drop(stdin);
 
     child.wait().map(|status| status.success()).unwrap_or(false)
+}
+
+/// Start time of `pid` in microseconds. It tells a process apart from a later
+/// one that reuses its pid.
+pub fn process_start_token(pid: u32) -> Option<u64> {
+    process_bsdinfo(pid).map(|info| bsdinfo_start_token(&info))
+}
+
+/// Process group of `pid` while that same process, matched by its start
+/// token, is alive on the terminal of the pane shell `shell_pid`. A stopped or
+/// backgrounded job still counts.
+pub fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Option<u32> {
+    let process = process_bsdinfo(pid)?;
+    let shell = process_bsdinfo(shell_pid)?;
+    (process.pbi_status != libc::SZOMB
+        && bsdinfo_start_token(&process) == start_token
+        && process.e_tdev == shell.e_tdev)
+        .then_some(process.pbi_pgid)
+}
+
+fn bsdinfo_start_token(info: &libc::proc_bsdinfo) -> u64 {
+    info.pbi_start_tvsec
+        .saturating_mul(1_000_000)
+        .saturating_add(info.pbi_start_tvusec)
 }
 
 pub(super) fn socket_peer_pid(fd: RawFd) -> Option<u32> {
