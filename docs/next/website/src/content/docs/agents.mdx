@@ -77,6 +77,8 @@ Blocked detection is deliberately strict for screen-manifest agents. Herdr only 
 
 Unusual new agent prompts may initially show as `idle` instead of `blocked` until Herdr learns that screen shape. Detection itself does not send input, but automation that trusts a mistaken idle state can type into an approval dialog. Inspect unexpected prompts before sending more input; idle status is not authorization to approve an action.
 
+Claude Code remains working while its live footer reports background shells or monitors, even when the current response is complete. Completion notifications wait until those counters disappear and Claude returns to idle.
+
 Antigravity and Grok count as idle once they return to their prompt, even if background tasks, monitors, or subagents are still running. `agent wait` and `agent prompt --wait` observe the agent's state, not completion of those jobs.
 
 Suspending an agent with Ctrl+Z preserves its name, session reference, and hook authority while the exact process remains alive behind the shell or another non-agent command. Returning with `fg` keeps that identity. This does not cover another recognized agent taking over the foreground. A retained identity does not mean the agent can receive input while suspended; inspect the pane before prompting it.

@@ -1,7 +1,7 @@
 id = "claude"
-version = "2026.10.11.1"
+version = "2026.10.25.1"
 min_engine_version = 2
-updated_at = "2026-10-11T00:00:00Z"
+updated_at = "2026-10-25T00:00:00Z"
 aliases = ["claude-code"]
 
 [[rules]]
@@ -41,6 +41,23 @@ visible_working = true
 # Claude renders activity summaries at column zero; wrapped continuations are indented.
 # Keeping that shape prevents user prompt text from impersonating this signal.
 regex = ['(?m)^[\x{002A}\x{00B7}\x{2722}\x{2736}\x{273B}\x{273D}][ \t]+\S[^\n]*?(?:\n[ \t]+[^\n]*?){0,3}·(?:[ \t]+|\n[ \t]*)[1-9]\d*(?:[ \t]+|\n[ \t]*)MCP(?:[ \t]+|\n[ \t]*)tasks?(?:[ \t]+|\n[ \t]*)still(?:[ \t]+|\n[ \t]*)running[ \t]*$']
+not = [
+  { contains = ["do you want to proceed?"] },
+  { contains = ["esc to cancel"] },
+  { contains = ["waiting for permission"] },
+  { contains = ["do you want to allow this connection?"] },
+  { contains = ["tab to amend"] },
+  { contains = ["ctrl+e to explain"] },
+]
+
+[[rules]]
+id = "background_shells_monitors_working"
+state = "working"
+priority = 960
+region = "after_last_horizontal_rule"
+visible_working = true
+# Read current footer counters, never completed-turn summaries in the transcript.
+line_regex = ['^[ \t]*(?:[^\r\n]*·[ \t]+)?[1-9]\d* (?:shells?|monitors?)(?:,[ \t]+[1-9]\d* (?:shells?|monitors?))*[ \t]*$']
 not = [
   { contains = ["do you want to proceed?"] },
   { contains = ["esc to cancel"] },
